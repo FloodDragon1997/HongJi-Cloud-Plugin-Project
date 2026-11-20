@@ -27,6 +27,26 @@ _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+
+def _evict_stale_core() -> None:
+    """清理进程内残留的旧版本同名模块。
+
+    平台热更新时 sys.modules 里可能还缓存着上一版本目录下的 archive_core，
+    直接 import 会命中缓存（如新版本新增的符号在旧模块中不存在）。按 __file__
+    与本包目录比对，不一致则丢弃后重新按当前目录加载。
+    """
+    name = "archive_core"
+    cached = sys.modules.get(name)
+    if cached is None:
+        return
+    expected = (Path(_HERE) / f"{name}.py").resolve()
+    cached_file = getattr(cached, "__file__", None)
+    if not cached_file or Path(cached_file).resolve() != expected:
+        del sys.modules[name]
+
+
+_evict_stale_core()
+
 from app.sdk.store_plugin import HealthStatus  # noqa: E402
 from archive_core import (  # noqa: E402
     DEFAULT_MAX_ENTRIES,

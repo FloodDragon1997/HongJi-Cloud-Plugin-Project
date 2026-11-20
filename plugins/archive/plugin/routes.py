@@ -27,6 +27,21 @@ _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+
+def _evict_stale_core() -> None:
+    """同 main.py：丢弃上一版本残留的 archive_core 缓存，避免导入旧模块。"""
+    name = "archive_core"
+    cached = sys.modules.get(name)
+    if cached is None:
+        return
+    expected = (Path(_HERE) / f"{name}.py").resolve()
+    cached_file = getattr(cached, "__file__", None)
+    if not cached_file or Path(cached_file).resolve() != expected:
+        del sys.modules[name]
+
+
+_evict_stale_core()
+
 from fastapi import APIRouter, HTTPException, Query, Request  # noqa: E402
 from fastapi.responses import HTMLResponse, Response  # noqa: E402
 
