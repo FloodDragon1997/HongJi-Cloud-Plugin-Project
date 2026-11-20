@@ -1,12 +1,13 @@
 """缩略图 provider 协议与内置实现（能力插件模式，与 OCR providers 同构）。
 
-按适配器模式隔离，未获批准前不引入 Pillow 等第三方图像依赖：
+按适配器模式隔离，零依赖环境也可运行：
 - StubThumbnailProvider：本地占位实现，零依赖生成合法 PNG 占位缩略图
   （纯 Python + zlib：基于文件名哈希的纯色块），明确标注 engine="stub"。
   用途：流程打通、契约测试、离线演示。
 - PillowThumbnailProvider：真实缩放实现（惰性导入 Pillow），仅在运行环境
-  已安装 Pillow 时注册可用；未安装时 build_provider("pillow") 给出明确提示。
-  真实 provider 后续实现同一协议注册即可，不改插件/API。
+  已安装 Pillow 时注册可用；支持 EXIF 方向校正、动图取首帧、透明图保留 RGBA。
+- auto：默认选择，Pillow 可用则真实缩放，否则自动降级 stub 并在结果里带 notice。
+真实 provider 后续实现同一协议注册即可，不改插件/API。
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ import zlib
 from typing import Protocol
 
 DEFAULT_SIZES: tuple[int, ...] = (128, 256)
+MIN_SIZE = 16
+MAX_SIZE = 2048
 
 
 class ThumbnailProvider(Protocol):
@@ -62,7 +65,7 @@ class StubThumbnailProvider:
             "height": size,
             "format": "png",
             "engine": "stub",
-            "notice": "占位引擎：未安装 Pillow，当前生成纯色占位缩略图而非真实缩放",
+            "notice": "占位引擎：未执行真实缩放，输出纯色占位缩略图",
         }
 
 
@@ -75,45 +78,73 @@ class PillowThumbnailProvider:
         try:
             from io import BytesIO
 
-            from PIL import Image
+            from PIL import Image, ImageOps, UnidentifiedImageError
         except ImportError as exc:  # noqa: BLE001
             raise RuntimeError(
                 "pillow provider 需要安装 Pillow（pip install Pillow）；"
-                "当前环境未安装，可改用 stub provider"
+                "当前环境未安装，可改用 auto/stub provider"
             ) from exc
 
-        with Image.open(BytesIO(data)) as img:
-            img.thumbnail((size, size))
-            out = BytesIO()
-            img.save(out, format="PNG")
-            return {
-                "data": out.getvalue(),
-                "width": img.width,
-                "height": img.height,
-                "format": "png",
-                "engine": "pillow",
-            }
+        if not data:
+            raise ValueError(f"空文件无法生成缩略图: {filename}")
+        resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+        try:
+            with Image.open(BytesIO(data)) as img:
+                if getattr(img, "is_animated", False):
+                    img.seek(0)  # 动图只取首帧，避免逐帧解码
+                oriented = ImageOps.exif_transpose(img)
+                # 统一转 RGBA：兼容 P / CMYK / 16bit 等模式，并保留透明通道
+                canvas = (oriented or img).convert("RGBA")
+                canvas.thumbnail((size, size), resample)  # 等比缩放，只缩不放
+                out = BytesIO()
+                canvas.save(out, format="PNG", optimize=True)
+                width, height = canvas.size
+        except Image.DecompressionBombError as exc:
+            raise ValueError(f"图片像素超出安全上限，已拒绝处理: {filename}") from exc
+        except (UnidentifiedImageError, OSError) as exc:
+            raise ValueError(f"不支持或已损坏的图片: {filename}") from exc
+
+        return {
+            "data": out.getvalue(),
+            "width": width,
+            "height": height,
+            "format": "png",
+            "engine": "pillow",
+        }
+
+
+def _pillow_available() -> bool:
+    try:
+        import PIL.Image  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 _PROVIDERS: dict[str, type] = {"stub": StubThumbnailProvider}
-try:  # Pillow 可用时才暴露真实 provider（保持零依赖环境可用）
-    import PIL  # noqa: F401
-
+if _pillow_available():  # Pillow 可用时才暴露真实 provider（保持零依赖环境可用）
     _PROVIDERS["pillow"] = PillowThumbnailProvider
-except ImportError:
-    pass
 
 
 def available_providers() -> list[str]:
-    return sorted(_PROVIDERS)
+    return ["auto", *sorted(_PROVIDERS)]
 
 
 def register_provider(name: str, cls: type) -> None:
     _PROVIDERS[name] = cls
 
 
-def build_provider(name: str = "stub") -> ThumbnailProvider:
-    cls = _PROVIDERS.get(name)
+def resolve_provider_name(name: str | None = "auto") -> str:
+    """auto 按环境能力选择；显式指定的引擎原样返回（可用性由 build_provider 校验）。"""
+    if not name or name == "auto":
+        return "pillow" if "pillow" in _PROVIDERS else "stub"
+    return name
+
+
+def build_provider(name: str = "auto") -> ThumbnailProvider:
+    resolved = resolve_provider_name(name)
+    cls = _PROVIDERS.get(resolved)
     if cls is None:
-        raise ValueError(f"未注册的缩略图 provider: {name}（可用: {sorted(_PROVIDERS)}）")
+        raise ValueError(
+            f"未注册的缩略图 provider: {name}（可用: {available_providers()}）")
     return cls()

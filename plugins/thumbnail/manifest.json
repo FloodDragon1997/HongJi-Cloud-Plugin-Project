@@ -1,7 +1,7 @@
 {
   "id": "thumbnail",
   "name": "缩略图生成插件",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "capability",
   "entry": "plugin/main.py",
   "permissions": ["fs.read"],
@@ -9,11 +9,19 @@
   "config_schema": [
     {
       "key": "provider",
-      "label": "提供方 Provider",
-      "type": "text",
-      "placeholder": "stub",
+      "label": "缩略图引擎",
+      "type": "select",
+      "options": ["auto", "pillow", "stub"],
+      "placeholder": "auto",
       "full": true,
-      "hint": "默认 stub（内置演示）；真实 provider 实现同一协议注册即可"
+      "hint": "auto：优先 Pillow 真实缩放，未安装时自动降级为占位引擎"
+    },
+    {
+      "key": "default_size",
+      "label": "默认长边(px)",
+      "type": "number",
+      "placeholder": "128",
+      "hint": "等比缩放，只缩不放；取值 16–2048"
     }
   ]
 }
