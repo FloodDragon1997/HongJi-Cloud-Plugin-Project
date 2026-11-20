@@ -131,6 +131,11 @@ class RemoteStoragePluginBase(StoragePlugin):
                 raise PluginUnavailable(str(exc)) from exc
         return self._transport
 
+    def _ensure_writable(self) -> None:
+        """只读配置统一映射为 45001（PluginUnavailable），不依赖传输层各自实现。"""
+        if self.readonly:
+            raise PluginUnavailable("远程存储插件处于只读模式，禁止写入")
+
     def capabilities(self) -> dict:
         return {
             "stream": True,
@@ -156,6 +161,7 @@ class RemoteStoragePluginBase(StoragePlugin):
 
     def put(self, key: str, data: bytes) -> PutResult:
         k = _safe_key(key)
+        self._ensure_writable()
         try:
             self.transport.put(k, data, self.readonly)
         except RemoteUnavailable as exc:
@@ -164,12 +170,13 @@ class RemoteStoragePluginBase(StoragePlugin):
 
     def put_stream(self, key: str, fileobj: BinaryIO) -> PutResult:
         k = _safe_key(key)
+        self._ensure_writable()
         # 能力探测：不支持 write_stream 的 Transport 走旧路径（保持向后兼容）
         write_stream = getattr(self.transport, "write_stream", None)
         if callable(write_stream):
             reader = _HashingReader(fileobj)
             try:
-                write_stream(k, reader)
+                write_stream(k, reader, self.readonly)
             except RemoteUnavailable as exc:
                 raise PluginUnavailable(f"流式写入失败: {exc}") from exc
             return PutResult(key=k, size=reader.size, etag=reader.md5.hexdigest())
@@ -253,13 +260,15 @@ class RemoteStoragePluginBase(StoragePlugin):
         return {"size": int(size), "etag": etag}
 
     def exists(self, key: str) -> bool:
+        k = _safe_key(key)
         try:
-            return self.transport.exists(_safe_key(key))
-        except (RemoteUnavailable, ValueError):
-            return False
+            return self.transport.exists(k)
+        except RemoteUnavailable as exc:
+            raise PluginUnavailable(f"读取元信息失败: {exc}") from exc
 
     def delete(self, key: str) -> None:
         k = _safe_key(key)
+        self._ensure_writable()
         try:
             self.transport.delete(k)
         except RemoteUnavailable as exc:
@@ -267,6 +276,7 @@ class RemoteStoragePluginBase(StoragePlugin):
 
     def copy(self, src_key: str, dst_key: str) -> PutResult:
         src, dst = _safe_key(src_key), _safe_key(dst_key)
+        self._ensure_writable()
         try:
             self.transport.copy(src, dst)
         except RemoteObjectNotFound as exc:

@@ -5,11 +5,14 @@
 - GET /api/archive/{file_id}/entry?name=...   单条目内容，文本类强制 text/plain
 - GET /api/archive/{file_id}/view             无脚本目录页，供 iframe 预览
 
+鉴权（规范 3.5 / 9.8）：所有端点声明 SDK 导出的 CurrentUser 依赖，未登录直接 401，
+与平台会话（Cookie / Bearer）保持一致。
+
 文件字节获取（安全红线：路由模块禁止导入 app.*）：
-带平台会话 Cookie 反向调用平台自身的文件下载接口，按 FILE_API_CANDIDATES 依次尝试，
-404/405 时回退下一个候选。平台接口路径若不同，只需调整该常量，或用环境变量
-HJ_ARCHIVE_FILE_APIS（英文逗号分隔）覆盖；站点地址默认取当前请求的 base_url，
-也可用 HJ_ARCHIVE_PLATFORM_BASE 覆盖（反向代理场景）。
+携带当前请求的会话凭据（Cookie / Authorization）反向调用平台自身的文件下载接口，
+按 FILE_API_CANDIDATES 依次尝试，404/405 时回退下一个候选。平台接口路径若不同，
+只需调整该常量，或用环境变量 HJ_ARCHIVE_FILE_APIS（英文逗号分隔）覆盖；
+站点地址默认取当前请求的 base_url，也可用 HJ_ARCHIVE_PLATFORM_BASE 覆盖（反向代理场景）。
 """
 
 from __future__ import annotations
@@ -45,6 +48,7 @@ _evict_stale_core()
 from fastapi import APIRouter, HTTPException, Query, Request  # noqa: E402
 from fastapi.responses import HTMLResponse, Response  # noqa: E402
 
+from app.sdk.store_plugin import CurrentUser  # noqa: E402
 from archive_core import (  # noqa: E402
     MAX_ENTRIES_LIMIT,
     list_entries,
@@ -138,16 +142,28 @@ def _read_capped(resp) -> bytes:
     return b"".join(chunks)
 
 
-def _fetch_archive(request: Request, file_id: int) -> bytes:
+def _credential_headers(request: Request) -> dict:
+    """透传当前请求的会话凭据，使反向调用沿用同一平台会话（Cookie / Bearer）。"""
+    headers = {"Accept": "*/*"}
     cookie = request.headers.get("cookie")
-    if not cookie:
-        raise HTTPException(401, "缺少平台会话 Cookie，无法读取文件")
+    if cookie:
+        headers["Cookie"] = cookie
+    authorization = request.headers.get("authorization")
+    if authorization:
+        headers["Authorization"] = authorization
+    return headers
+
+
+def _fetch_archive(request: Request, file_id: int) -> bytes:
+    headers = _credential_headers(request)
+    if "Cookie" not in headers and "Authorization" not in headers:
+        raise HTTPException(401, "缺少平台会话凭据，无法读取文件")
     failures: list[str] = []
     for base in _platform_bases(request):
         for template in FILE_API_CANDIDATES:
             url = f"{base}{template.format(file_id=file_id)}"
             try:
-                req = urllib.request.Request(url, headers={"Cookie": cookie, "Accept": "*/*"})
+                req = urllib.request.Request(url, headers=headers)
                 with _OPENER.open(req, timeout=_TIMEOUT) as resp:
                     return _read_capped(resp)
             except urllib.error.HTTPError as exc:
@@ -170,9 +186,10 @@ def _fetch_archive(request: Request, file_id: int) -> bytes:
 def list_entries_endpoint(
     file_id: int,
     request: Request,
+    user: CurrentUser,
     limit: int | None = Query(default=None, ge=1, le=MAX_ENTRIES_LIMIT),
 ) -> dict:
-    """条目元数据列表，供前端渲染压缩包目录树。"""
+    """条目元数据列表，供前端渲染压缩包目录树（仅登录用户可访问）。"""
     data = _fetch_archive(request, file_id)
     try:
         return list_entries(data, str(file_id), max_entries=limit)
@@ -184,6 +201,7 @@ def list_entries_endpoint(
 def read_entry_endpoint(
     file_id: int,
     request: Request,
+    user: CurrentUser,
     name: str = Query(..., min_length=1, max_length=4096, description="压缩包内条目路径"),
 ) -> Response:
     """单个条目内容：可预览类型 inline，其余按附件返回；文本类强制 text/plain。"""
@@ -208,7 +226,7 @@ def read_entry_endpoint(
 
 
 @router.get("/{file_id}/view", response_class=HTMLResponse)
-def view_endpoint(file_id: int, request: Request) -> HTMLResponse:
+def view_endpoint(file_id: int, request: Request, user: CurrentUser) -> HTMLResponse:
     """无脚本目录页：ui.preview 把 preview_type=archive 映射到 iframe 后由它渲染。"""
     data = _fetch_archive(request, file_id)
     try:

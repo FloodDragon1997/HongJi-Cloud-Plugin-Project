@@ -1,7 +1,7 @@
 {
   "id": "archive",
   "name": "压缩包处理插件",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "type": "capability",
   "entry": "plugin/main.py",
   "permissions": ["fs.read", "net.outbound"],
@@ -12,7 +12,8 @@
       {"type": "archive", "render": "iframe"}
     ],
     "actions": [
-      {"label": "查看压缩包", "path": "/api/archive/{file_id}/view", "method": "GET"}
+      {"label": "查看压缩包", "path": "/api/archive/{file_id}/view", "method": "GET",
+       "description": "在独立窗口浏览压缩包条目列表", "scope": "file", "result": "open"}
     ]
   },
   "config_schema": [
