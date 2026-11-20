@@ -21,7 +21,7 @@ from hj_remote_base import RemoteStoragePluginBase  # noqa: E402
 class FtpPlugin(RemoteStoragePluginBase):
     plugin_id = "ftp"
     display_name = "FTP 存储"
-    required_permissions = ("net.outbound", "kv.meta")
+    required_permissions = ("net.outbound",)
     transport_kind = "ftp"
     config_schema = [
         {"key": "host", "label": "FTP 主机", "type": "text", "required": True,

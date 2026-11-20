@@ -51,6 +51,7 @@ class MyStoragePlugin(StoragePlugin):
     def __init__(self, config: dict | None = None):
         super().__init__(config)
         self.root = Path(self.config.get("root") or "./data_store").resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
         self.readonly = bool(self.config.get("readonly"))
 
     # --- 内部：路径安全 ---
@@ -72,20 +73,16 @@ class MyStoragePlugin(StoragePlugin):
             "multipart": True,
             "max_object_bytes": 1024 ** 4,
             "server_side_copy": True,
+            "readonly": self.readonly,
         }
 
     def health_check(self) -> HealthStatus:
+        # 只读探测：不做任何写入/副作用，只读模式下 writable 恒为 False
         start = time.time()
-        try:
-            self.root.mkdir(parents=True, exist_ok=True)
-            if not self.readonly:
-                probe = self.root / ".health_probe"
-                probe.write_bytes(b"")
-                probe.unlink()
-        except OSError as exc:
-            return HealthStatus(False, False, f"数据根目录不可用: {exc}")
-        latency = int((time.time() - start) * 1000)
-        return HealthStatus(True, not self.readonly, "ok", latency)
+        if not self.root.is_dir():
+            return HealthStatus(False, False, f"数据根目录不存在: {self.root}")
+        writable = not self.readonly and os.access(self.root, os.W_OK)
+        return HealthStatus(True, writable, "ok", int((time.time() - start) * 1000))
 
     def put(self, key: str, data: bytes) -> PutResult:
         return self.put_stream(key, io.BytesIO(data))

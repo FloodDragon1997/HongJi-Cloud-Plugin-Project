@@ -1,10 +1,10 @@
 {
   "id": "ftp",
   "name": "FTP 存储",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "storage",
   "entry": "plugin/main.py",
-  "permissions": ["net.outbound", "kv.meta"],
+  "permissions": ["net.outbound"],
   "sdk_version": "1.0",
   "config_schema": [
     {

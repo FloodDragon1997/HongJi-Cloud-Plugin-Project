@@ -1,7 +1,7 @@
 {
   "id": "my_storage",
   "name": "我的存储后端",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "storage",
   "entry": "plugin/main.py",
   "permissions": ["fs.read", "fs.write", "fs.list"],

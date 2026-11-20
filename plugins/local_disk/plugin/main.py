@@ -9,7 +9,6 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
-import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -40,6 +39,7 @@ class LocalDiskPlugin(StoragePlugin):
         root = self.config.get("root") or "./data_store"
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.readonly = bool(self.config.get("readonly"))
 
     # --- 路径安全 ---
     def _resolve(self, key: str) -> Path:
@@ -48,6 +48,10 @@ class LocalDiskPlugin(StoragePlugin):
             raise ValueError(f"非法对象键（目录穿越）: {key}")
         return candidate
 
+    def _ensure_writable(self) -> None:
+        if self.readonly:
+            raise PluginUnavailable("本地磁盘插件处于只读模式，禁止写入")
+
     # --- 契约实现 ---
     def capabilities(self) -> dict:
         return {
@@ -55,21 +59,19 @@ class LocalDiskPlugin(StoragePlugin):
             "multipart": True,
             "max_object_bytes": 1024 ** 4,
             "server_side_copy": True,
+            "readonly": self.readonly,
         }
 
     def health_check(self) -> HealthStatus:
+        # 只读探测：不做任何写入/副作用，只读模式下 writable 恒为 False
         start = time.time()
-        try:
-            if not self.root.is_dir():
-                return HealthStatus(False, False, f"数据根目录不存在: {self.root}")
-            fd, probe = tempfile.mkstemp(prefix=".health_", dir=self.root)
-            os.close(fd)
-            os.unlink(probe)
-        except OSError as exc:
-            return HealthStatus(False, False, f"数据根目录不可写: {exc}")
-        return HealthStatus(True, True, "ok", int((time.time() - start) * 1000))
+        if not self.root.is_dir():
+            return HealthStatus(False, False, f"数据根目录不存在: {self.root}")
+        writable = not self.readonly and os.access(self.root, os.W_OK)
+        return HealthStatus(True, writable, "ok", int((time.time() - start) * 1000))
 
     def put(self, key: str, data: bytes) -> PutResult:
+        self._ensure_writable()
         path = self._resolve(key)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -79,6 +81,7 @@ class LocalDiskPlugin(StoragePlugin):
         return PutResult(key=key, size=len(data), etag=hashlib.md5(data).hexdigest())
 
     def put_stream(self, key: str, fileobj: BinaryIO) -> PutResult:
+        self._ensure_writable()
         path = self._resolve(key)
         md5 = hashlib.md5()
         size = 0
@@ -145,6 +148,7 @@ class LocalDiskPlugin(StoragePlugin):
         return self._resolve(key).is_file()
 
     def delete(self, key: str) -> None:
+        self._ensure_writable()
         path = self._resolve(key)
         try:
             path.unlink(missing_ok=True)
@@ -152,6 +156,7 @@ class LocalDiskPlugin(StoragePlugin):
             raise PluginUnavailable(f"本地磁盘删除失败: {exc}") from exc
 
     def copy(self, src_key: str, dst_key: str) -> PutResult:
+        self._ensure_writable()
         src = self._resolve(src_key)
         if not src.is_file():
             raise PluginObjectNotFound(src_key)

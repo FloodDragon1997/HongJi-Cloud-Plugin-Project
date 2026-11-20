@@ -21,7 +21,7 @@ from hj_remote_base import RemoteStoragePluginBase  # noqa: E402
 class WebDavPlugin(RemoteStoragePluginBase):
     plugin_id = "webdav"
     display_name = "WebDAV 存储"
-    required_permissions = ("net.outbound", "kv.meta")
+    required_permissions = ("net.outbound",)
     transport_kind = "webdav"
     config_schema = [
         {"key": "url", "label": "服务地址", "type": "text", "required": True,

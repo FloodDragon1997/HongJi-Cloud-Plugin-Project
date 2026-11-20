@@ -234,9 +234,28 @@ class WebDavTransport:
         return total
 
     def stat(self, key: str) -> tuple[int, str]:
-        _, body, headers = self._request("GET", key)
-        size = int(headers.get("Content-Length") or len(body))
-        return size, hashlib.md5(body).hexdigest()
+        """流式计算 size 与 MD5：逐块读响应体，内存峰值 ≤ STREAM_CHUNK。"""
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(self._url(key), method="GET", headers=self._headers())
+        md5 = hashlib.md5()
+        size = 0
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                while True:
+                    chunk = resp.read(STREAM_CHUNK)
+                    if not chunk:
+                        break
+                    md5.update(chunk)
+                    size += len(chunk)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (404, 410):
+                raise RemoteObjectNotFound(key) from exc
+            raise RemoteUnavailable(f"WebDAV GET 失败: HTTP {exc.code}") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise RemoteUnavailable(f"WebDAV GET 失败: {exc}") from exc
+        return size, md5.hexdigest()
 
     def exists(self, key: str) -> bool:
         try:
@@ -391,8 +410,24 @@ class FtpTransport:
             ftp.quit()
 
     def stat(self, key: str) -> tuple[int, str]:
-        blob = self.get(key)
-        return len(blob), hashlib.md5(blob).hexdigest()
+        """流式计算 size 与 MD5：retrbinary 逐块喂入哈希器，不整对象入内存。"""
+        ftp = self._connect()
+        md5 = hashlib.md5()
+        size = 0
+
+        def _hash(block: bytes) -> None:
+            nonlocal size
+            md5.update(block)
+            size += len(block)
+
+        try:
+            try:
+                ftp.retrbinary(f"RETR {self._path(key)}", _hash)
+            except Exception as exc:  # noqa: BLE001
+                raise RemoteObjectNotFound(key) from exc
+            return size, md5.hexdigest()
+        finally:
+            ftp.quit()
 
     def exists(self, key: str) -> bool:
         ftp = self._connect()
@@ -418,7 +453,45 @@ class FtpTransport:
             ftp.quit()
 
     def copy(self, src: str, dst: str) -> None:
-        self.put(dst, self.get(src))
+        """服务端无 COPY 命令：用两条连接做流式中转，内存峰值 ≤ STREAM_CHUNK。"""
+        if self.readonly:
+            raise RemoteUnavailable("FTP 存储为只读模式")
+        src_ftp = self._connect()
+        dst_ftp = self._connect()
+        src_conn = None
+        dst_conn = None
+        try:
+            self._mkdirs(dst_ftp, self._path(dst))
+            src_ftp.voidcmd("TYPE I")
+            try:
+                src_conn, _ = src_ftp.transfercmd(f"RETR {self._path(src)}")
+            except Exception as exc:  # noqa: BLE001
+                raise RemoteObjectNotFound(src) from exc
+            dst_ftp.voidcmd("TYPE I")
+            dst_conn = dst_ftp.transfercmd(f"STOR {self._path(dst)}")
+            while True:
+                block = src_conn.recv(STREAM_CHUNK)
+                if not block:
+                    break
+                dst_conn.sendall(block)
+            dst_conn.close()
+            dst_conn = None
+            src_conn.close()
+            src_conn = None
+            dst_ftp.voidresp()
+            src_ftp.voidresp()
+        finally:
+            for conn in (src_conn, dst_conn):
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+            for ftp in (src_ftp, dst_ftp):
+                try:
+                    ftp.quit()
+                except Exception:  # noqa: BLE001
+                    pass
 
     def probe(self) -> tuple[bool, bool, str]:
         ftp = self._connect()

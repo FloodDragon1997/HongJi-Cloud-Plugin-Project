@@ -23,7 +23,7 @@ from app.sdk.store_plugin import (
 class S3Plugin(StoragePlugin):
     plugin_id = "s3"
     display_name = "S3 对象存储"
-    required_permissions = ("net.outbound", "kv.meta")
+    required_permissions = ("net.outbound",)
     config_schema = [
         {"key": "bucket", "label": "存储桶 Bucket", "type": "text", "required": True,
          "placeholder": "如：hjcloud-data", "full": True},
@@ -38,7 +38,12 @@ class S3Plugin(StoragePlugin):
 
     def __init__(self, config: dict | None = None):
         super().__init__(config)
+        self.readonly = bool(self.config.get("readonly"))
         self._client = None
+
+    def _ensure_writable(self) -> None:
+        if self.readonly:
+            raise PluginUnavailable("S3 插件处于只读模式，禁止写入")
 
     # --- 客户端懒加载 ---
     def client(self):
@@ -85,6 +90,7 @@ class S3Plugin(StoragePlugin):
             "multipart": True,
             "max_object_bytes": 5 * 1024 ** 4,
             "server_side_copy": True,
+            "readonly": self.readonly,
         }
 
     def health_check(self) -> HealthStatus:
@@ -93,10 +99,11 @@ class S3Plugin(StoragePlugin):
         start = time.time()
         try:
             self.client().head_bucket(Bucket=self._bucket())
-        except Exception as exc:
-            self._map_error(exc)
-            return HealthStatus(False, False, str(exc), int((time.time() - start) * 1000))
-        return HealthStatus(True, True, "ok", int((time.time() - start) * 1000))
+        except Exception as exc:  # noqa: BLE001  健康检查只返回状态，不向上抛异常
+            return HealthStatus(False, False, f"S3 不可用: {exc}",
+                                int((time.time() - start) * 1000))
+        return HealthStatus(True, not self.readonly, "ok",
+                            int((time.time() - start) * 1000))
 
     def put(self, key: str, data: bytes) -> PutResult:
         return self.put_stream(key, io.BytesIO(data))
@@ -121,6 +128,7 @@ class S3Plugin(StoragePlugin):
         - 单块内读完（含空文件）→ 单次 put_object
         - 超过单块 → multipart 分片上传，异常时 abort 避免残留分片
         """
+        self._ensure_writable()
         client = self.client()
         md5 = hashlib.md5()
 
@@ -199,6 +207,15 @@ class S3Plugin(StoragePlugin):
         etag = head.get("ETag", "").strip('"')
         return {"size": head["ContentLength"], "etag": etag}
 
+    def stat_size(self, key: str) -> int:
+        """只需字节数的路径走这里：HEAD 一次即可，避免 GET 全量读对象。"""
+        try:
+            head = self.client().head_object(Bucket=self._bucket(), Key=key)
+        except Exception as exc:
+            self._map_error(exc)
+            raise  # pragma: no cover
+        return int(head["ContentLength"])
+
     def exists(self, key: str) -> bool:
         try:
             self.client().head_object(Bucket=self._bucket(), Key=key)
@@ -208,15 +225,17 @@ class S3Plugin(StoragePlugin):
                 self._map_error(exc)
             except PluginObjectNotFound:
                 return False
-            return False
+            raise  # pragma: no cover  后端不可用等异常向上抛，不伪装成"不存在"
 
     def delete(self, key: str) -> None:
+        self._ensure_writable()
         try:
             self.client().delete_object(Bucket=self._bucket(), Key=key)
         except Exception as exc:
             self._map_error(exc)
 
     def copy(self, src_key: str, dst_key: str) -> PutResult:
+        self._ensure_writable()
         try:
             self.client().copy_object(
                 Bucket=self._bucket(), CopySource={"Bucket": self._bucket(), "Key": src_key},
