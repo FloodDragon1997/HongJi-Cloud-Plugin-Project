@@ -1,0 +1,40 @@
+{
+  "id": "archive",
+  "name": "压缩包处理插件",
+  "version": "1.0.0",
+  "type": "capability",
+  "entry": "plugin/main.py",
+  "permissions": ["fs.read"],
+  "sdk_version": "1.0",
+  "config_schema": [
+    {
+      "key": "max_entries",
+      "label": "最大条目数",
+      "type": "number",
+      "placeholder": "2000",
+      "hint": "超出后列表截断、读取跳过，防压缩炸弹；取值 1–10000"
+    },
+    {
+      "key": "max_entry_size",
+      "label": "单条目上限(MB)",
+      "type": "number",
+      "placeholder": "64",
+      "hint": "单个文件解压后字节上限，超出按大小拒绝；取值 1–1024"
+    },
+    {
+      "key": "max_total_size",
+      "label": "累计解压上限(MB)",
+      "type": "number",
+      "placeholder": "512",
+      "hint": "一次读取全部条目的累积上限；取值 1–4096"
+    },
+    {
+      "key": "filename_encoding",
+      "label": "文件名编码",
+      "type": "select",
+      "options": ["auto", "utf-8", "gbk", "cp437"],
+      "placeholder": "auto",
+      "hint": "仅对未标记 UTF-8 的旧 ZIP 生效；auto 依次尝试 UTF-8、GBK"
+    }
+  ]
+}
