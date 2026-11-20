@@ -1,7 +1,7 @@
 {
   "id": "ocr",
   "name": "OCR 文字识别插件",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "capability",
   "entry": "plugin/main.py",
   "permissions": ["fs.read"],
@@ -9,11 +9,26 @@
   "config_schema": [
     {
       "key": "provider",
-      "label": "提供方 Provider",
-      "type": "text",
-      "placeholder": "stub",
+      "label": "识别引擎",
+      "type": "select",
+      "options": ["auto", "tesseract", "rapidocr", "stub"],
+      "placeholder": "auto",
       "full": true,
-      "hint": "默认 stub（内置演示）；真实 provider 实现同一协议注册即可"
+      "hint": "auto：优先 Tesseract，其次 RapidOCR（PP-OCR），均不可用时降级占位"
+    },
+    {
+      "key": "language",
+      "label": "识别语言",
+      "type": "text",
+      "placeholder": "chi_sim+eng",
+      "hint": "仅 Tesseract 生效；RapidOCR 默认中英混排"
+    },
+    {
+      "key": "max_pages",
+      "label": "PDF 最多识别页数",
+      "type": "number",
+      "placeholder": "20",
+      "hint": "取值 1–50"
     }
   ]
 }

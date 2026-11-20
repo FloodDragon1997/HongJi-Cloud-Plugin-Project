@@ -77,8 +77,8 @@ from my_helpers import helper  # noqa: E402
 | `s3` | storage | S3 / MinIO 等 S3 兼容存储 | `boto3`（平台已内置） |
 | `webdav` | storage | WebDAV 存储 | 无（标准库） |
 | `ftp` | storage | FTP 存储 | 无（标准库） |
-| `ocr` | capability | OCR 文字识别（stub provider） | 无 |
-| `thumbnail` | capability | 缩略图生成（stub；`pillow` provider 需 Pillow） | 可选 Pillow |
+| `ocr` | capability | OCR 文字识别（`auto` 优先 Tesseract，其次 RapidOCR/PP-OCR，缺失时降级占位） | 可选 pytesseract+Tesseract / rapidocr+onnxruntime / PyMuPDF（PDF） |
+| `thumbnail` | capability | 缩略图生成（`auto` 优先 Pillow 真实缩放，未安装自动降级占位） | 可选 Pillow |
 | `preview` | capability | 在线预览类型判定与内容协商 | 无 |
 
 > 这些插件与平台内置插件同 `id`。平台启动时会把内置插件同步进插件表，因此直接上传同 `id`
