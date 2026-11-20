@@ -70,21 +70,37 @@ _TIMEOUT = 20
 router = APIRouter(prefix="/api/archive", tags=["plugin-archive"])
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """禁止跟随重定向，避免携带平台会话 Cookie 被转发到其他站点。"""
+class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+    """跟随重定向，但跨站时丢弃 Cookie，避免会话被带到第三方。
+
+    平台在反向代理下常把 http 301 到 https（同站），必须允许跟随；
+    对象存储预签名地址则跨站，此时不应携带平台会话 Cookie。
+    """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
+            new.remove_header("Cookie")
+        return new
 
 
-_OPENER = urllib.request.build_opener(_NoRedirect)
+_OPENER = urllib.request.build_opener(_SafeRedirect)
 
 
 # ---------------------------------------------------------------- 平台文件读取
 
 def _platform_base(request: Request) -> str:
     override = os.environ.get("HJ_ARCHIVE_PLATFORM_BASE", "").strip()
-    return (override or str(request.base_url)).rstrip("/")
+    if override:
+        return override.rstrip("/")
+    parts = urllib.parse.urlsplit(str(request.base_url))
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    scheme = proto or parts.scheme
+    host = parts.netloc
+    # 公网站点统一走 https：反向代理对 http 会 301，白白多一次往返
+    if scheme == "http" and not host.startswith(("127.0.0.1", "localhost", "[::1]")):
+        scheme = "https"
+    return f"{scheme}://{host}"
 
 
 def _read_capped(resp) -> bytes:
@@ -125,7 +141,7 @@ def _fetch_archive(request: Request, file_id: int) -> bytes:
                 failures.append(f"{url} → {exc.code}")
                 continue
             if 300 <= exc.code < 400:
-                raise HTTPException(502, "平台文件接口返回重定向，已拒绝跟随") from exc
+                raise HTTPException(502, "平台文件接口重定向次数超限") from exc
             status = 401 if exc.code in (401, 403) else 502
             raise HTTPException(status, f"平台文件接口返回 {exc.code}") from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:

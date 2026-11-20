@@ -1,7 +1,7 @@
 {
   "id": "archive",
   "name": "压缩包处理插件",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "type": "capability",
   "entry": "plugin/main.py",
   "permissions": ["fs.read", "net.outbound"],
