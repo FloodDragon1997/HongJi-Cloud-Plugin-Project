@@ -1,11 +1,20 @@
 {
   "id": "archive",
   "name": "压缩包处理插件",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "capability",
   "entry": "plugin/main.py",
-  "permissions": ["fs.read"],
+  "permissions": ["fs.read", "net.outbound"],
   "sdk_version": "1.0",
+  "routes": ["plugin/routes.py"],
+  "ui": {
+    "preview": [
+      {"type": "archive", "render": "iframe"}
+    ],
+    "actions": [
+      {"label": "查看压缩包", "path": "/api/archive/{file_id}/view", "method": "GET"}
+    ]
+  },
   "config_schema": [
     {
       "key": "max_entries",

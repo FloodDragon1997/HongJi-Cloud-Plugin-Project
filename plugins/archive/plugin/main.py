@@ -7,7 +7,8 @@
 - 条目结构带 previewable / preview_type / mime，前端可直接渲染压缩包目录树并选渲染器；
 - preview(data, filename, entry_name) 一次调用即可取目录或单条目（文本类强制 text/plain）；
 - 嵌套压缩包标记 preview_type=archive，前端可继续展开；
-- 未接入 routes：条目图片/PDF 的内联需要业务侧提供条目级内容地址（见插件开发规范 3.5）。
+- manifest 的 ui.preview 将 archive 映射到 iframe，ui.actions 在右键菜单提供
+  「查看压缩包」；对应动态路由见 routes.py（条目 JSON、单条目内容、无脚本目录页）。
 
 安全边界：不落盘、不调用 extractall，条目名统一清洗（防 Zip Slip），加密 ZIP 明确拒绝；
 纯标准库实现，无运行依赖。
@@ -64,7 +65,7 @@ class ArchivePlugin:
          "options": list(ENCODINGS), "placeholder": "auto",
          "hint": "仅对未标记 UTF-8 的旧 ZIP 生效；auto 依次尝试 UTF-8、GBK"},
     ]
-    required_permissions = ("fs.read",)
+    required_permissions = ("fs.read", "net.outbound")
 
     def __init__(self, config: dict | None = None):
         self.config = config or {}
@@ -88,6 +89,7 @@ class ArchivePlugin:
             "pack": True,
             "preview": True,
             "preview_types": list(PREVIEW_TYPES),
+            "preview_url": "/api/archive/{file_id}/view",
             "encrypted": False,
             "max_entries": self.max_entries,
             "max_entry_bytes": self.max_entry_bytes,
