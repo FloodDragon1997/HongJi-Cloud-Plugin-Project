@@ -1,0 +1,62 @@
+{
+  "id": "doc_viewer",
+  "name": "文档查看插件",
+  "version": "1.0.0",
+  "type": "capability",
+  "entry": "plugin/main.py",
+  "permissions": ["fs.read", "net.outbound"],
+  "sdk_version": "1.0",
+  "routes": ["plugin/routes.py"],
+  "ui": {
+    "menu": [
+      {"label": "文档查看", "icon": "plug"}
+    ],
+    "page": {
+      "title": "文档查看",
+      "description": "在线查看 DOCX、XLSX、PPTX 文档；旧版 Office 格式给出下载引导。",
+      "links": [
+        {"label": "支持格式与限制", "path": "/api/doc_viewer/formats", "method": "GET"}
+      ]
+    },
+    "preview": [
+      {"type": "docx", "render": "iframe"},
+      {"type": "xlsx", "render": "iframe"},
+      {"type": "pptx", "render": "iframe"}
+    ],
+    "actions": [
+      {"label": "查看文档", "path": "/api/doc_viewer/{file_id}/view?name={file_name}",
+       "method": "GET", "description": "在独立窗口打开文档预览", "scope": "file",
+       "result": "open"}
+    ]
+  },
+  "config_schema": [
+    {
+      "key": "max_decompressed_mb",
+      "label": "解压后上限(MB)",
+      "type": "number",
+      "placeholder": "64",
+      "hint": "文档 zip 解压总量上限，超出提示下载查看；取值 1–256"
+    },
+    {
+      "key": "max_table_rows",
+      "label": "表格最大行数",
+      "type": "number",
+      "placeholder": "500",
+      "hint": "Excel 单表展示行数上限，超出截断；取值 1–5000"
+    },
+    {
+      "key": "max_table_cols",
+      "label": "表格最大列数",
+      "type": "number",
+      "placeholder": "60",
+      "hint": "Excel 单表展示列数上限，超出截断；取值 1–200"
+    },
+    {
+      "key": "max_slides",
+      "label": "最大幻灯片数",
+      "type": "number",
+      "placeholder": "100",
+      "hint": "PPTX 展示页数上限，超出截断；取值 1–500"
+    }
+  ]
+}
