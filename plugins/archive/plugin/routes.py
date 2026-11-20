@@ -65,7 +65,7 @@ FILE_API_CANDIDATES = tuple(
 #: 单次读取压缩包的硬上限（防止把超大文件整体拉进内存）
 MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _CHUNK = 8 * 1024 * 1024
-_TIMEOUT = 20
+_TIMEOUT = 8
 
 router = APIRouter(prefix="/api/archive", tags=["plugin-archive"])
 
@@ -89,10 +89,21 @@ _OPENER = urllib.request.build_opener(_SafeRedirect)
 
 # ---------------------------------------------------------------- 平台文件读取
 
-def _platform_base(request: Request) -> str:
+def _platform_bases(request: Request) -> list[str]:
+    """返回可尝试的平台站点地址，按优先级排列。
+
+    优先回环直连（uvicorn 监听端口），避免服务器经公网域名访问自身时
+    因安全组/回环 NAT 不通而超时；本地回环不通时再走请求来源地址。
+    """
     override = os.environ.get("HJ_ARCHIVE_PLATFORM_BASE", "").strip()
     if override:
-        return override.rstrip("/")
+        return [override.rstrip("/")]
+
+    bases: list[str] = []
+    server = request.scope.get("server") or ()
+    if len(server) > 1 and isinstance(server[1], int) and server[1] not in (80, 443):
+        bases.append(f"http://127.0.0.1:{server[1]}")
+
     parts = urllib.parse.urlsplit(str(request.base_url))
     proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
     scheme = proto or parts.scheme
@@ -100,7 +111,10 @@ def _platform_base(request: Request) -> str:
     # 公网站点统一走 https：反向代理对 http 会 301，白白多一次往返
     if scheme == "http" and not host.startswith(("127.0.0.1", "localhost", "[::1]")):
         scheme = "https"
-    return f"{scheme}://{host}"
+    origin = f"{scheme}://{host}"
+    if origin not in bases:
+        bases.append(origin)
+    return bases
 
 
 def _read_capped(resp) -> bytes:
@@ -128,25 +142,25 @@ def _fetch_archive(request: Request, file_id: int) -> bytes:
     cookie = request.headers.get("cookie")
     if not cookie:
         raise HTTPException(401, "缺少平台会话 Cookie，无法读取文件")
-    base = _platform_base(request)
     failures: list[str] = []
-    for template in FILE_API_CANDIDATES:
-        url = f"{base}{template.format(file_id=file_id)}"
-        try:
-            req = urllib.request.Request(url, headers={"Cookie": cookie, "Accept": "*/*"})
-            with _OPENER.open(req, timeout=_TIMEOUT) as resp:
-                return _read_capped(resp)
-        except urllib.error.HTTPError as exc:
-            if exc.code in (404, 405):
-                failures.append(f"{url} → {exc.code}")
-                continue
-            if 300 <= exc.code < 400:
-                raise HTTPException(502, "平台文件接口重定向次数超限") from exc
-            status = 401 if exc.code in (401, 403) else 502
-            raise HTTPException(status, f"平台文件接口返回 {exc.code}") from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            failures.append(f"{url} → {exc}")
-            continue
+    for base in _platform_bases(request):
+        for template in FILE_API_CANDIDATES:
+            url = f"{base}{template.format(file_id=file_id)}"
+            try:
+                req = urllib.request.Request(url, headers={"Cookie": cookie, "Accept": "*/*"})
+                with _OPENER.open(req, timeout=_TIMEOUT) as resp:
+                    return _read_capped(resp)
+            except urllib.error.HTTPError as exc:
+                if exc.code in (404, 405):
+                    failures.append(f"{url} → {exc.code}")
+                    continue
+                if 300 <= exc.code < 400:
+                    raise HTTPException(502, "平台文件接口重定向次数超限") from exc
+                status = 401 if exc.code in (401, 403) else 502
+                raise HTTPException(status, f"平台文件接口返回 {exc.code}") from exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                failures.append(f"{url} → {exc}")
+                break  # 该地址整体不通，直接换下一个地址
     raise HTTPException(502, "无法读取文件内容：" + "；".join(failures))
 
 
