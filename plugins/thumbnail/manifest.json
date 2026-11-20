@@ -1,0 +1,19 @@
+{
+  "id": "thumbnail",
+  "name": "缩略图生成插件",
+  "version": "1.0.0",
+  "type": "capability",
+  "entry": "plugin/main.py",
+  "permissions": ["fs.read"],
+  "sdk_version": "1.0",
+  "config_schema": [
+    {
+      "key": "provider",
+      "label": "提供方 Provider",
+      "type": "text",
+      "placeholder": "stub",
+      "full": true,
+      "hint": "默认 stub（内置演示）；真实 provider 实现同一协议注册即可"
+    }
+  ]
+}

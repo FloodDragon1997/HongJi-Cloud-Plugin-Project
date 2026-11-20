@@ -1,0 +1,24 @@
+{
+  "id": "my_storage",
+  "name": "我的存储后端",
+  "version": "0.1.0",
+  "type": "storage",
+  "entry": "plugin/main.py",
+  "permissions": ["fs.read", "fs.write", "fs.list"],
+  "sdk_version": "1.0",
+  "config_schema": [
+    {
+      "key": "root",
+      "label": "挂载根目录",
+      "type": "text",
+      "placeholder": "./data_store",
+      "full": true,
+      "hint": "服务器上的目录路径，留空使用默认 ./data_store"
+    },
+    {
+      "key": "readonly",
+      "label": "只读模式（禁写）",
+      "type": "checkbox"
+    }
+  ]
+}

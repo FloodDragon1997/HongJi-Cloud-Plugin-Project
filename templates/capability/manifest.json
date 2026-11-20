@@ -1,0 +1,19 @@
+{
+  "id": "my_capability",
+  "name": "我的能力插件",
+  "version": "0.1.0",
+  "type": "capability",
+  "entry": "plugin/main.py",
+  "permissions": ["fs.read"],
+  "sdk_version": "1.0",
+  "config_schema": [
+    {
+      "key": "provider",
+      "label": "提供方 Provider",
+      "type": "text",
+      "placeholder": "stub",
+      "full": true,
+      "hint": "默认 stub；接入真实服务时填写提供方标识"
+    }
+  ]
+}
