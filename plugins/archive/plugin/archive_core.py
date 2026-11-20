@@ -31,6 +31,23 @@ ZIP_FORMATS = ("zip",)
 TAR_FORMATS = ("tar", "tar.gz", "tar.bz2", "tar.xz")
 SUPPORTED_FORMATS = ZIP_FORMATS + TAR_FORMATS
 
+# --- 条目预览口径（与 preview 插件的 classify 保持一致；安全红线禁止跨插件导入，故本地维护） ---
+IMAGE_EXTS = frozenset({"png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"})
+PDF_EXTS = frozenset({"pdf"})
+VIDEO_EXTS = frozenset({"mp4", "webm", "mov", "m4v", "ogv"})
+AUDIO_EXTS = frozenset({"mp3", "wav", "ogg", "m4a", "aac", "flac", "opus"})
+TEXT_EXTS = frozenset({
+    "txt", "md", "json", "csv", "log", "xml", "yml", "yaml", "ini", "cfg", "toml",
+    "py", "js", "ts", "java", "c", "cpp", "h", "go", "rs", "sh", "sql", "rst",
+    "html", "css",
+})
+OFFICE_EXTS = frozenset({
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "wps", "odt", "ods", "odp", "rtf",
+})
+ARCHIVE_EXTS = frozenset({"zip", "tar", "gz", "tgz", "bz2", "xz", "7z"})
+
+PREVIEW_TYPES = ("image", "pdf", "video", "audio", "text", "docx", "office", "archive", "none")
+
 #: 明确识别但暂不支持，用于给出可操作的错误提示
 UNSUPPORTED_MAGIC = {
     b"7z\xbc\xaf\x27\x1c": "7z",
@@ -91,6 +108,44 @@ def safe_entry_name(raw: str) -> str:
 def guess_mime(name: str) -> str:
     guessed, _ = mimetypes.guess_type(name)
     return guessed or "application/octet-stream"
+
+
+def _ext(name: str) -> str:
+    base = name.rsplit("/", 1)[-1]
+    return base.rsplit(".", 1)[-1].lower() if "." in base else ""
+
+
+def classify_entry(name: str) -> dict:
+    """按条目名给出前端预览口径：{mime, previewable, preview_type, hint?}。
+
+    口径与 preview 插件一致：图片/PDF/音视频/文本/docx 可内联；Office 需转换服务；
+    SVG 因可执行脚本不内联；嵌套压缩包标记为 archive，前端可继续展开。
+    """
+    ext = _ext(name)
+    mime = guess_mime(name)
+    if ext in IMAGE_EXTS:
+        return {"mime": mime, "previewable": True, "preview_type": "image"}
+    if ext in PDF_EXTS:
+        return {"mime": mime, "previewable": True, "preview_type": "pdf"}
+    if ext in VIDEO_EXTS:
+        return {"mime": mime, "previewable": True, "preview_type": "video"}
+    if ext in AUDIO_EXTS:
+        return {"mime": mime, "previewable": True, "preview_type": "audio"}
+    if ext in TEXT_EXTS:
+        return {"mime": mime, "previewable": True, "preview_type": "text"}
+    if ext == "docx":
+        return {"mime": mime, "previewable": True, "preview_type": "docx"}
+    if ext in OFFICE_EXTS:
+        return {"mime": mime, "previewable": False, "preview_type": "office",
+                "hint": "Office 文档需转换服务，建议下载后查看"}
+    if ext in ARCHIVE_EXTS:
+        return {"mime": mime, "previewable": True, "preview_type": "archive",
+                "hint": "嵌套压缩包，可继续展开"}
+    if ext == "svg":
+        return {"mime": mime, "previewable": False, "preview_type": "none",
+                "hint": "SVG 可在同源执行脚本，不提供内联预览"}
+    return {"mime": mime, "previewable": False, "preview_type": "none",
+            "hint": "不支持内联预览，建议下载"}
 
 
 def _clip(value, low: int, high: int, default: int) -> int:
@@ -161,7 +216,7 @@ def _describe(name_raw: str, size: int, is_dir: bool, mtime, encoded: bool = Fal
     except ValueError:
         name = name_raw.replace("\\", "/")
         safe = False
-    return {
+    item = {
         "name": name,
         "size": int(size or 0),
         "is_dir": is_dir,
@@ -169,6 +224,11 @@ def _describe(name_raw: str, size: int, is_dir: bool, mtime, encoded: bool = Fal
         "mtime": mtime,
         "encrypted": encoded,
     }
+    if is_dir:
+        item.update({"mime": "inode/directory", "previewable": False, "preview_type": "none"})
+    else:
+        item.update(classify_entry(name))
+    return item
 
 
 # ---------------------------------------------------------------- 读取
@@ -279,12 +339,15 @@ def _collect_zip(data: bytes, filename: str, names: list[str] | None, max_entrie
                 payload = stream.read(max_entry_bytes)
             payload = payload[:max_total_bytes - total]
             total += len(payload)
+            preview = classify_entry(name)
             entries.append({
                 "name": name,
                 "size": len(payload),
                 "declared_size": int(info.file_size or 0),
                 "data": payload,
-                "mime": guess_mime(name),
+                "mime": preview["mime"],
+                "previewable": preview["previewable"],
+                "preview_type": preview["preview_type"],
                 "truncated": len(payload) < info.file_size,
             })
     finally:
@@ -337,12 +400,15 @@ def _collect_tar(data: bytes, filename: str, names: list[str] | None, max_entrie
                 payload = stream.read(max_entry_bytes)
             payload = payload[:max_total_bytes - total]
             total += len(payload)
+            preview = classify_entry(name)
             entries.append({
                 "name": name,
                 "size": len(payload),
                 "declared_size": int(member.size or 0),
                 "data": payload,
-                "mime": guess_mime(name),
+                "mime": preview["mime"],
+                "previewable": preview["previewable"],
+                "preview_type": preview["preview_type"],
                 "truncated": len(payload) < member.size,
             })
     finally:
@@ -391,6 +457,8 @@ def read_entry(data: bytes, filename: str = "", entry_name: str = "", *,
             "declared_size": item["declared_size"],
             "data": item["data"],
             "mime": item["mime"],
+            "previewable": item["previewable"],
+            "preview_type": item["preview_type"],
             "truncated": item["truncated"],
             "format": result["format"],
         }

@@ -3,10 +3,14 @@
 职责：对 zip / tar / tar.gz / tar.bz2 / tar.xz 做元数据列表、单条目读取、批量读取，
 以及 zip 打包（供在线浏览、按需下载、批量打包下载复用）。
 
-- 不落盘、不调用 extractall：全程内存受限读取，单条目上限默认 64MB；
-- 条目名统一清洗（防 Zip Slip），加密 ZIP 明确拒绝；
-- 7z / rar 明确报错，引导改用 zip 或 tar；
-- 纯标准库实现，无运行依赖。
+前端预览优化：
+- 条目结构带 previewable / preview_type / mime，前端可直接渲染压缩包目录树并选渲染器；
+- preview(data, filename, entry_name) 一次调用即可取目录或单条目（文本类强制 text/plain）；
+- 嵌套压缩包标记 preview_type=archive，前端可继续展开；
+- 未接入 routes：条目图片/PDF 的内联需要业务侧提供条目级内容地址（见插件开发规范 3.5）。
+
+安全边界：不落盘、不调用 extractall，条目名统一清洗（防 Zip Slip），加密 ZIP 明确拒绝；
+纯标准库实现，无运行依赖。
 
 业务侧以 registry.create("archive", config) 取实例后调用下列方法；
 方法名与返回结构需与平台调用方约定一致（同 OCR / thumbnail / preview）。
@@ -31,6 +35,7 @@ from archive_core import (  # noqa: E402
     MAX_ENTRIES_LIMIT,
     MAX_ENTRY_BYTES_LIMIT,
     MAX_TOTAL_BYTES_LIMIT,
+    PREVIEW_TYPES,
     SUPPORTED_FORMATS,
     clamp_limits,
     list_entries as _list_entries,
@@ -81,6 +86,8 @@ class ArchivePlugin:
             "list": True,
             "read": True,
             "pack": True,
+            "preview": True,
+            "preview_types": list(PREVIEW_TYPES),
             "encrypted": False,
             "max_entries": self.max_entries,
             "max_entry_bytes": self.max_entry_bytes,
@@ -111,10 +118,27 @@ class ArchivePlugin:
                              encoding=self.encoding)
 
     def read_entry(self, data: bytes, filename: str = "", entry_name: str = "") -> dict:
-        """读取单个条目：{name, size, declared_size, data, mime, truncated, format}。"""
+        """读取单个条目：{name, size, declared_size, data, mime, previewable,
+        preview_type, truncated, format}。"""
         return _read_entry(data, filename, entry_name, max_bytes=self.max_entry_bytes,
                            max_total_bytes=self.max_total_bytes,
                            encoding=self.encoding)
+
+    def preview(self, data: bytes, filename: str = "", entry_name: str | None = None) -> dict:
+        """前端预览入口：不传 entry_name 返回压缩包目录树，传入则返回该条目内容。
+
+        目录结果带 preview_type="archive"；条目结果带 previewable/preview_type，
+        文本类统一 text/plain，避免 HTML 等内容被同源内联执行。
+        """
+        if not entry_name:
+            listing = self.list_entries(data, filename)
+            listing["preview_type"] = "archive"
+            listing["previewable"] = True
+            return listing
+        item = self.read_entry(data, filename, entry_name)
+        if item["preview_type"] == "text":
+            item["mime"] = "text/plain; charset=utf-8"
+        return item
 
     def read_entries(self, data: bytes, filename: str = "",
                      names: list[str] | None = None) -> dict:

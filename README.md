@@ -80,7 +80,7 @@ from my_helpers import helper  # noqa: E402
 | `ocr` | capability | OCR 文字识别（`auto` 优先 Tesseract，其次 RapidOCR/PP-OCR，缺失时降级占位） | 可选 pytesseract+Tesseract / rapidocr+onnxruntime / PyMuPDF（PDF） |
 | `thumbnail` | capability | 缩略图生成（`auto` 优先 Pillow 真实缩放，未安装自动降级占位） | 可选 Pillow |
 | `preview` | capability | 在线预览类型判定与内容协商 | 无 |
-| `archive` | capability | 压缩包条目浏览、单条目/批量读取与 zip 打包（防 Zip Slip 与压缩炸弹） | 无（标准库） |
+| `archive` | capability | 压缩包条目浏览、条目预览口径、单条目/批量读取与 zip 打包（防 Zip Slip 与压缩炸弹） | 无（标准库） |
 
 > 这些插件与平台内置插件同 `id`。平台启动时会把内置插件同步进插件表，因此直接上传同 `id`
 > 的 zip 会因重复安装被拒绝（45002）。本仓库用于统一维护这些插件的源码；需要在平台外置
