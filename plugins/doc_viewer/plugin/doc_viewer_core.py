@@ -1,13 +1,16 @@
-"""Office 文档查看核心（纯标准库，平台无关）。
+"""文档查看核心（纯标准库，平台无关）。
 
-支持 WordprocessingML（docx）、SpreadsheetML（xlsx）、PresentationML（pptx）
-的只读解析，输出可直接嵌入预览页的安全 HTML 片段与纯文本：
+支持只读解析并输出安全 HTML 片段与纯文本：
 
-- Word：标题层级、段落/对齐、粗体/斜体/下划线/删除线/字号/颜色、超链接、
-  编号与项目符号、表格（跨列）、内嵌图片、页面结构；
-- Excel：工作表、共享字符串、单元格样式（粗体/颜色/对齐/百分比/日期）、
+- Word（docx）：标题层级、段落/对齐、粗体/斜体/下划线/删除线/字号/颜色、
+  超链接、编号与项目符号、表格（跨列）、内嵌图片、页面结构；
+- Excel（xlsx）：工作表、共享字符串、单元格样式（粗体/颜色/对齐/百分比/日期）、
   合并单元格、行列上限截断；
-- PowerPoint：按放映顺序输出每页文本、缩进层级。
+- PowerPoint（pptx）：按放映顺序输出每页文本、缩进层级；
+- OpenDocument（odt/ods/odp）：标题、段落、列表、表格、图片与演示页；
+- RTF：控制字清洗后输出纯文本（保留段落、制表与常见符号）；
+- CSV/TSV：按分隔符嗅探渲染为表格；
+- PDF：由浏览器原生查看器直出（路由层返回原始字节）。
 
 安全边界：
 - 所有文本经 ``html.escape`` 转义，不解析文档中的 HTML/宏，不执行任何脚本；
@@ -19,6 +22,7 @@
 
 from __future__ import annotations
 
+import csv
 import html
 import io
 import posixpath
@@ -46,7 +50,14 @@ MAX_SHEETS = 20
 DOCX_EXTS = frozenset({"docx"})
 XLSX_EXTS = frozenset({"xlsx"})
 PPTX_EXTS = frozenset({"pptx"})
-SUPPORTED_FORMATS = ("docx", "xlsx", "pptx")
+PDF_EXTS = frozenset({"pdf"})
+ODT_EXTS = frozenset({"odt"})
+ODS_EXTS = frozenset({"ods"})
+ODP_EXTS = frozenset({"odp"})
+RTF_EXTS = frozenset({"rtf"})
+CSV_EXTS = frozenset({"csv", "tsv"})
+SUPPORTED_FORMATS = ("docx", "xlsx", "pptx", "pdf", "odt", "ods", "odp",
+                     "rtf", "csv", "tsv")
 
 #: 已识别但暂不支持在线渲染的格式（给出下载引导）
 LEGACY_FORMATS = {
@@ -56,17 +67,14 @@ LEGACY_FORMATS = {
     "wps": "WPS 文档",
     "et": "WPS 表格",
     "dps": "WPS 演示文稿",
-    "rtf": "RTF 文档",
-    "odt": "OpenDocument 文本文档",
-    "ods": "OpenDocument 电子表格",
-    "odp": "OpenDocument 演示文稿",
     "ofd": "OFD 版式文档",
     "pages": "Pages 文档",
     "numbers": "Numbers 表格",
     "key": "Keynote 演示文稿",
 }
 
-PREVIEW_TYPES = ("docx", "xlsx", "pptx", "office", "none")
+PREVIEW_TYPES = ("docx", "xlsx", "pptx", "pdf", "odt", "ods", "odp",
+                 "rtf", "csv", "tsv", "office", "none")
 
 #: 允许在线展示的图片扩展名（SVG 刻意排除：同源内联会形成存储型 XSS）
 MEDIA_MIMES = {
@@ -77,7 +85,14 @@ MEDIA_MIMES = {
     "bmp": "image/bmp",
     "webp": "image/webp",
 }
-MEDIA_PREFIXES = ("word/media/", "xl/media/", "ppt/media/")
+MEDIA_PREFIXES = ("word/media/", "xl/media/", "ppt/media/", "Pictures/")
+
+#: OpenDocument 包内 mimetype → 类型
+_ODF_MIMETYPES = {
+    "application/vnd.oasis.opendocument.text": "odt",
+    "application/vnd.oasis.opendocument.spreadsheet": "ods",
+    "application/vnd.oasis.opendocument.presentation": "odp",
+}
 
 _W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
@@ -87,6 +102,14 @@ _S = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 _REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 _V = "{urn:schemas-microsoft-com:vml}"
 _DC_TITLE = "{http://purl.org/dc/elements/1.1/}title"
+
+_OFF = "{urn:oasis:names:tc:opendocument:xmlns:office:1.0}"
+_TXT = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
+_TBL = "{urn:oasis:names:tc:opendocument:xmlns:table:1.0}"
+_OSTYLE = "{urn:oasis:names:tc:opendocument:xmlns:style:1.0}"
+_FO = "{urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0}"
+_ODRAW = "{urn:oasis:names:tc:opendocument:xmlns:drawing:1.0}"
+_XLINK = "{http://www.w3.org/1999/xlink}"
 
 _CELL_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
 _DRIVE_RE = re.compile(r"^[A-Za-z]:")
@@ -227,34 +250,43 @@ def _read_rels(archive: zipfile.ZipFile, path: str, base: str) -> dict[str, dict
 
 
 def detect_kind(data: bytes, filename: str = "") -> str:
-    """判定文档类型：docx/xlsx/pptx 或已识别的旧格式扩展名，未知返回 none。"""
+    """判定文档类型：OpenXML/OpenDocument/PDF 优先按内容识别，其余按扩展名。"""
     ext = _ext(filename)
-    if ext in LEGACY_FORMATS:
-        return ext
+    if data[:5] == b"%PDF-":
+        return "pdf"
     if data[:2] == b"PK":
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as archive:
                 names = set(archive.namelist())
+                odf = None
+                if "mimetype" in names:
+                    try:
+                        mime = archive.read("mimetype").decode("ascii", "ignore").strip()
+                    except (KeyError, zipfile.BadZipFile):
+                        mime = ""
+                    odf = _ODF_MIMETYPES.get(mime)
         except (zipfile.BadZipFile, ValueError):
-            names = set()
+            names, odf = set(), None
         if "word/document.xml" in names:
             return "docx"
         if "xl/workbook.xml" in names:
             return "xlsx"
         if "ppt/presentation.xml" in names:
             return "pptx"
+        if odf:
+            return odf
+        if "content.xml" in names and "META-INF/manifest.xml" in names:
+            return ext if ext in (ODT_EXTS | ODS_EXTS | ODP_EXTS) else "odt"
+    if ext in LEGACY_FORMATS:
+        return ext
     return ext if ext in SUPPORTED_FORMATS else "none"
 
 
 def classify(ext: str) -> tuple[bool, str]:
     """扩展名 → (previewable, preview_type)，与平台预览口径保持一致。"""
     ext = (ext or "").lower().lstrip(".")
-    if ext in DOCX_EXTS:
-        return True, "docx"
-    if ext in XLSX_EXTS:
-        return True, "xlsx"
-    if ext in PPTX_EXTS:
-        return True, "pptx"
+    if ext in SUPPORTED_FORMATS:
+        return True, ext
     if ext in LEGACY_FORMATS:
         return False, "office"
     return False, "none"
@@ -303,7 +335,7 @@ def _unsupported_result(kind: str, filename: str) -> dict:
         f"<h2>暂不支持在线查看</h2>"
         f"<p><strong>{safe_name}</strong></p>"
         f"<p>{html.escape(label)}暂不支持浏览器内渲染，请下载后使用本地应用打开。</p>"
-        '<p class="hint">支持在线查看：DOCX（Word）、XLSX（Excel）、PPTX（PowerPoint）。</p>'
+        '<p class="hint">支持在线查看：DOCX、XLSX、PPTX、PDF、ODT、ODS、ODP、RTF、CSV、TSV。</p>'
         "</div>"
     )
     return _result(ext, _stem(filename) or label, body, "", {"supported": False},
@@ -1275,6 +1307,616 @@ def _render_pptx(archive: zipfile.ZipFile, filename: str, max_slides: int) -> di
                    counts, warnings)
 
 
+# ---------------------------------------------------------------- OpenDocument（odt/ods/odp）
+
+def _odf_style_map(archive: zipfile.ZipFile) -> dict[str, dict]:
+    styles: dict[str, dict] = {}
+    for path in ("styles.xml", "content.xml"):
+        root = _load_xml(archive, path)
+        if root is None:
+            continue
+        for container_tag in (_OFF + "styles", _OFF + "automatic-styles"):
+            for container in root.iter(container_tag):
+                for style in container.findall(_OSTYLE + "style"):
+                    sid = style.get(_OSTYLE + "name")
+                    if not sid:
+                        continue
+                    entry = {"parent": style.get(_OSTYLE + "parent-style-name")}
+                    props = style.find(_OSTYLE + "text-properties")
+                    if props is not None:
+                        weight = (props.get(_FO + "font-weight") or "").lower()
+                        if weight:
+                            entry["bold"] = weight in ("bold", "600", "700", "800", "900")
+                        shape = (props.get(_FO + "font-style") or "").lower()
+                        if shape:
+                            entry["italic"] = shape in ("italic", "oblique")
+                        under = (props.get(_OSTYLE + "text-underline-style") or "").lower()
+                        if under:
+                            entry["underline"] = under != "none"
+                        color = (props.get(_FO + "color") or "").lstrip("#")
+                        if _HEX_RE.match(color):
+                            entry["color"] = "#" + color.upper()
+                        size = (props.get(_FO + "font-size") or "").lower()
+                        if re.match(r"^\d+(?:\.\d+)?(?:pt|px|cm|mm)$", size):
+                            entry["size"] = size
+                    para = style.find(_OSTYLE + "paragraph-properties")
+                    if para is not None:
+                        align = (para.get(_FO + "text-align") or "").lower()
+                        if align in ("center", "justify"):
+                            entry["align"] = align
+                        elif align in ("end", "right"):
+                            entry["align"] = "right"
+                        margin = (para.get(_FO + "margin-left") or "").lower()
+                        if re.match(r"^\d+(?:\.\d+)?(?:pt|px|cm|mm)$", margin):
+                            entry["margin"] = margin
+                    level = style.get(_OSTYLE + "default-outline-level")
+                    if level:
+                        entry["outline"] = level
+                    styles.setdefault(sid, {}).update(entry)
+    return styles
+
+
+def _odf_style(styles: dict[str, dict], name: str) -> dict:
+    chain: list[dict] = []
+    seen: set[str] = set()
+    current = name
+    while current and current in styles and current not in seen:
+        seen.add(current)
+        chain.append(styles[current])
+        current = styles[current].get("parent")
+    merged: dict = {}
+    for entry in reversed(chain):
+        merged.update({k: v for k, v in entry.items() if k != "parent"})
+    return merged
+
+
+def _odf_wrap_inline(text: str, style: dict) -> str:
+    if not text:
+        return ""
+    if style.get("bold"):
+        text = f"<strong>{text}</strong>"
+    if style.get("italic"):
+        text = f"<em>{text}</em>"
+    css: list[str] = []
+    if style.get("underline"):
+        css.append("text-decoration:underline")
+    if style.get("color"):
+        css.append("color:" + style["color"])
+    if style.get("size"):
+        css.append("font-size:" + style["size"])
+    if css:
+        text = f'<span style="{";".join(css)}">{text}</span>'
+    return text
+
+
+def _odf_image_tag(node, ctx: dict) -> str:
+    img = node.find(_ODRAW + "image") if node.tag == _ODRAW + "frame" else node
+    if img is None:
+        return ""
+    href = img.get(_XLINK + "href") or ""
+    if not href or not _is_media_target(href):
+        return ""
+    ctx["images"] += 1
+    src = f'{ctx["media_prefix"]}{urllib.parse.quote(href)}'
+    return (f'<img class="doc-img" src="{html.escape(src, quote=True)}"'
+            ' alt="图片" loading="lazy">')
+
+
+def _odf_inline(node, styles: dict, ctx: dict, out: list[str]) -> None:
+    if node.text:
+        out.append(html.escape(node.text))
+    for child in node:
+        tag = child.tag
+        if tag == _TXT + "s":
+            try:
+                count = int(child.get(_TXT + "c") or 1)
+            except (TypeError, ValueError):
+                count = 1
+            out.append(" " * max(1, min(count, 200)))
+        elif tag == _TXT + "tab":
+            out.append("&emsp;")
+        elif tag == _TXT + "line-break":
+            out.append("<br>")
+        elif tag == _TXT + "a":
+            inner: list[str] = []
+            _odf_inline(child, styles, ctx, inner)
+            href = child.get(_XLINK + "href") or ""
+            if href and href.lower().startswith(_SAFE_SCHEMES):
+                out.append('<a href="' + html.escape(href, quote=True)
+                           + '" target="_blank" rel="noopener noreferrer">'
+                           + "".join(inner) + "</a>")
+            else:
+                out.append("".join(inner))
+        elif tag in (_ODRAW + "frame", _ODRAW + "image"):
+            out.append(_odf_image_tag(child, ctx))
+        else:
+            inner = []
+            _odf_inline(child, styles, ctx, inner)
+            style_name = (child.get(_TXT + "style-name")
+                          or child.get(_OSTYLE + "style-name") or "")
+            out.append(_odf_wrap_inline("".join(inner), _odf_style(styles, style_name)))
+        if child.tail:
+            out.append(html.escape(child.tail))
+
+
+def _odf_raw_text(node) -> str:
+    parts: list[str] = []
+    if node.text:
+        parts.append(node.text)
+    for child in node:
+        if child.tag == _TXT + "s":
+            try:
+                parts.append(" " * max(1, int(child.get(_TXT + "c") or 1)))
+            except (TypeError, ValueError):
+                parts.append(" ")
+        elif child.tag == _TXT + "tab":
+            parts.append("\t")
+        elif child.tag == _TXT + "line-break":
+            parts.append("\n")
+        elif child.tag in (_ODRAW + "frame", _ODRAW + "image"):
+            pass
+        else:
+            parts.append(_odf_raw_text(child))
+        if child.tail:
+            parts.append(child.tail)
+    return "".join(parts)
+
+
+def _odf_para(node, styles: dict, ctx: dict, heading: bool = False) -> str:
+    inner: list[str] = []
+    _odf_inline(node, styles, ctx, inner)
+    content = "".join(inner)
+    raw = _odf_raw_text(node).strip()
+    if raw:
+        ctx["text"].append(raw)
+    style = _odf_style(styles, node.get(_TXT + "style-name") or "")
+    if heading:
+        try:
+            level = int(node.get(_TXT + "outline-level") or style.get("outline") or 1)
+        except (TypeError, ValueError):
+            level = 1
+        level = max(1, min(level, 6))
+        ctx["headings"] += 1
+        return f"<h{level}>{content or html.escape(raw)}</h{level}>"
+    if not content:
+        return ""
+    css: list[str] = []
+    if style.get("align"):
+        css.append("text-align:" + style["align"])
+    if style.get("margin"):
+        css.append("margin-left:" + style["margin"])
+    attr = f' style="{";".join(css)}"' if css else ""
+    return f"<p{attr}>{content}</p>"
+
+
+def _odf_list(node, styles: dict, ctx: dict) -> str:
+    items: list[str] = []
+    for item in node.findall(_TXT + "list-item"):
+        parts: list[str] = []
+        for child in item:
+            if child.tag == _TXT + "p":
+                inner: list[str] = []
+                _odf_inline(child, styles, ctx, inner)
+                raw = _odf_raw_text(child).strip()
+                if raw:
+                    ctx["text"].append(raw)
+                if inner:
+                    parts.append("<p>" + "".join(inner) + "</p>")
+            elif child.tag == _TXT + "h":
+                parts.append(_odf_para(child, styles, ctx, True))
+            elif child.tag == _TXT + "list":
+                parts.append(_odf_list(child, styles, ctx))
+        if parts:
+            items.append("<li>" + "".join(parts) + "</li>")
+    return '<ul class="odf-list">' + "".join(items) + "</ul>" if items else ""
+
+
+def _odf_cell(cell, styles: dict, ctx: dict) -> str:
+    parts: list[str] = []
+    for child in cell:
+        if child.tag == _TXT + "p":
+            inner: list[str] = []
+            _odf_inline(child, styles, ctx, inner)
+            raw = _odf_raw_text(child).strip()
+            if raw:
+                ctx["text"].append(raw)
+            if inner:
+                parts.append("<p>" + "".join(inner) + "</p>")
+        elif child.tag == _TXT + "list":
+            parts.append(_odf_list(child, styles, ctx))
+    return "".join(parts)
+
+
+def _odf_table(table, styles: dict, ctx: dict, rows_limit: int, cols_limit: int) -> str:
+    ctx["tables"] += 1
+    rows_html: list[str] = []
+    used_rows = 0
+    for row in table.findall(_TBL + "table-row"):
+        if used_rows >= rows_limit:
+            ctx["truncated"] = True
+            break
+        try:
+            row_repeat = max(1, int(row.get(_TBL + "number-rows-repeated") or 1))
+        except (TypeError, ValueError):
+            row_repeat = 1
+        cells_html: list[str] = []
+        used_cols = 0
+        for cell in row:
+            if cell.tag == _TBL + "covered-table-cell":
+                continue
+            if cell.tag != _TBL + "table-cell":
+                continue
+            try:
+                colspan = max(1, int(cell.get(_TBL + "number-columns-spanned") or 1))
+            except (TypeError, ValueError):
+                colspan = 1
+            try:
+                rowspan = max(1, int(cell.get(_TBL + "number-rows-spanned") or 1))
+            except (TypeError, ValueError):
+                rowspan = 1
+            try:
+                col_repeat = max(1, int(cell.get(_TBL + "number-columns-repeated") or 1))
+            except (TypeError, ValueError):
+                col_repeat = 1
+            content = _odf_cell(cell, styles, ctx)
+            if not content:
+                value = (cell.get(_OFF + "value")
+                         or cell.get(_OFF + "date-value")
+                         or cell.get(_OFF + "boolean-value") or "")
+                value_type = (cell.get(_OFF + "value-type") or "").lower()
+                if value_type == "percentage" and value:
+                    try:
+                        value = f"{float(value) * 100:g}%"
+                    except ValueError:
+                        pass
+                content = html.escape(str(value)) if value else "&nbsp;"
+            attrs = ""
+            if colspan > 1:
+                attrs += f' colspan="{colspan}"'
+            if rowspan > 1:
+                attrs += f' rowspan="{rowspan}"'
+            for _ in range(min(col_repeat, max(0, cols_limit - used_cols))):
+                cells_html.append(f"<td{attrs}>{content}</td>")
+                used_cols += 1
+            if used_cols >= cols_limit:
+                ctx["truncated"] = True
+                break
+        if not cells_html:
+            continue
+        row_html = "<tr>" + "".join(cells_html) + "</tr>"
+        for _ in range(min(row_repeat, rows_limit - used_rows)):
+            rows_html.append(row_html)
+            used_rows += 1
+        if row_repeat > 1 and used_rows >= rows_limit:
+            ctx["truncated"] = True
+    if not rows_html:
+        return ""
+    return '<table class="doc-table"><tbody>' + "".join(rows_html) + "</tbody></table>"
+
+
+def _odf_blocks(container, styles: dict, ctx: dict) -> str:
+    blocks: list[str] = []
+    for child in container:
+        tag = child.tag
+        if tag == _TXT + "h":
+            blocks.append(_odf_para(child, styles, ctx, True))
+        elif tag == _TXT + "p":
+            blocks.append(_odf_para(child, styles, ctx))
+        elif tag == _TXT + "list":
+            blocks.append(_odf_list(child, styles, ctx))
+        elif tag == _TBL + "table":
+            blocks.append(_odf_table(child, styles, ctx, ctx["max_rows"], ctx["max_cols"]))
+        elif tag in (_TXT + "section", _ODRAW + "text-box"):
+            blocks.append(_odf_blocks(child, styles, ctx))
+        elif tag in (_ODRAW + "frame", _ODRAW + "image"):
+            blocks.append(_odf_image_tag(child, ctx))
+        elif tag in (_TXT + "soft-page-break", _TXT + "table-of-content",
+                     _TXT + "tracked-changes", _TXT + "sequence-decls"):
+            continue
+        elif len(child):
+            blocks.append(_odf_blocks(child, styles, ctx))
+    return "".join(blocks)
+
+
+def _odf_context(media_prefix: str, rows: int, cols: int) -> dict:
+    return {
+        "media_prefix": media_prefix,
+        "text": [],
+        "tables": 0,
+        "headings": 0,
+        "images": 0,
+        "truncated": False,
+        "max_rows": rows,
+        "max_cols": cols,
+    }
+
+
+def _render_odt(archive: zipfile.ZipFile, filename: str,
+                rows: int, cols: int, media_prefix: str) -> dict:
+    root = _load_xml(archive, "content.xml")
+    if root is None:
+        raise ValueError("文档缺少正文（content.xml）")
+    body = root.find(_OFF + "body")
+    text_el = body.find(_OFF + "text") if body is not None else None
+    if text_el is None:
+        raise ValueError("OpenDocument 文本文档正文结构损坏")
+    styles = _odf_style_map(archive)
+    ctx = _odf_context(media_prefix, rows, cols)
+    content = _odf_blocks(text_el, styles, ctx)
+    if not content:
+        content = '<p class="notice-inline">文档正文为空。</p>'
+    warnings = ["表格行列超出上限，已截断"] if ctx["truncated"] else []
+    counts = {
+        "paragraphs": len(ctx["text"]),
+        "tables": ctx["tables"],
+        "headings": ctx["headings"],
+        "images": ctx["images"],
+    }
+    return _result("odt", _stem(filename) or "OpenDocument 文档",
+                   content, "\n".join(ctx["text"]).strip(), counts, warnings)
+
+
+def _render_ods(archive: zipfile.ZipFile, filename: str,
+                rows: int, cols: int) -> dict:
+    root = _load_xml(archive, "content.xml")
+    if root is None:
+        raise ValueError("文档缺少正文（content.xml）")
+    body = root.find(_OFF + "body")
+    sheet_el = body.find(_OFF + "spreadsheet") if body is not None else None
+    if sheet_el is None:
+        raise ValueError("OpenDocument 电子表格正文结构损坏")
+    styles = _odf_style_map(archive)
+    ctx = _odf_context("", rows, cols)
+    tables = sheet_el.findall(_TBL + "table")[:MAX_SHEETS]
+    sections: list[str] = []
+    for index, table in enumerate(tables, 1):
+        name = table.get(_TBL + "name") or f"工作表 {index}"
+        table_html = _odf_table(table, styles, ctx, rows, cols)
+        if not table_html:
+            table_html = '<p class="notice-inline">空工作表</p>'
+        sections.append(f'<section class="sheet"><h2>{html.escape(name)}</h2>'
+                        f"{table_html}</section>")
+    if not sections:
+        sections.append('<p class="notice-inline">工作簿中没有工作表。</p>')
+    warnings = ["表格行列超出上限，已截断"] if ctx["truncated"] else []
+    counts = {"sheets": len(tables), "tables": ctx["tables"], "truncated": ctx["truncated"]}
+    return _result("ods", _stem(filename) or "OpenDocument 电子表格",
+                   "".join(sections), "\n".join(ctx["text"]).strip(), counts, warnings)
+
+
+def _render_odp(archive: zipfile.ZipFile, filename: str,
+                max_slides: int, media_prefix: str) -> dict:
+    root = _load_xml(archive, "content.xml")
+    if root is None:
+        raise ValueError("文档缺少正文（content.xml）")
+    body = root.find(_OFF + "body")
+    presentation = body.find(_OFF + "presentation") if body is not None else None
+    if presentation is None:
+        raise ValueError("OpenDocument 演示文稿正文结构损坏")
+    styles = _odf_style_map(archive)
+    ctx = _odf_context(media_prefix, 0, 0)
+    pages = presentation.findall(_ODRAW + "page")
+    total = len(pages)
+    sections: list[str] = []
+    for index, page in enumerate(pages[:max_slides], 1):
+        title = page.get(_ODRAW + "name") or f"第 {index} 页"
+        blocks: list[str] = []
+        for para in page.iter(_TXT + "p"):
+            inner: list[str] = []
+            _odf_inline(para, styles, ctx, inner)
+            raw = _odf_raw_text(para).strip()
+            if raw:
+                ctx["text"].append(raw)
+            if inner:
+                blocks.append(f'<p class="pp">{"".join(inner)}</p>')
+        for frame in page.iter(_ODRAW + "frame"):
+            image = _odf_image_tag(frame, ctx)
+            if image:
+                blocks.append(image)
+        if not blocks:
+            blocks.append('<p class="pp notice-inline">（空白页）</p>')
+        sections.append(
+            f'<section class="slide"><div class="slide-no">第 {index} / {total} 页</div>'
+            f"<h3>{html.escape(title)}</h3>{''.join(blocks)}</section>")
+    warnings = ["幻灯片超出上限，已截断"] if total > max_slides else []
+    counts = {"slides": min(total, max_slides), "images": ctx["images"]}
+    return _result("odp", _stem(filename) or "OpenDocument 演示文稿",
+                   "".join(sections), "\n".join(ctx["text"]).strip(), counts, warnings)
+
+
+# ---------------------------------------------------------------- RTF
+
+_RTF_SKIP_DESTS = frozenset({
+    "fonttbl", "colortbl", "stylesheet", "info", "pict", "object", "objdata",
+    "header", "headerl", "headerr", "footer", "footerl", "footerr", "footnote",
+    "annotation", "fldinst", "themedata", "datastore", "latentstyles",
+    "listtable", "listoverridetable", "rsidtbl", "generator", "filetbl",
+    "revtbl", "pn", "shpinst", "xmlnstbl", "colorschememapping",
+})
+
+
+def _strip_rtf_groups(text: str) -> str:
+    """删除字体表/样式表/图片等非正文分组，避免控制字泄漏到输出。"""
+    out: list[str] = []
+    i, n = 0, len(text)
+    pattern = re.compile(r"\{\\\*?\\?([A-Za-z]+)")
+    while i < n:
+        if text[i] == "{":
+            match = pattern.match(text[i:i + 48])
+            if match and (text.startswith("{\\*", i)
+                          or match.group(1).lower() in _RTF_SKIP_DESTS):
+                depth = 0
+                j = i
+                while j < n:
+                    if text[j] == "{":
+                        depth += 1
+                    elif text[j] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                i = j + 1 if j < n else n
+                continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def _rtf_to_text(data: bytes) -> str:
+    raw = data.decode("latin-1", "replace")
+    match = re.search(r"\\ansicpg(\d+)", raw)
+    codec = f"cp{match.group(1)}" if match else "cp1252"
+    try:
+        b"".decode(codec)
+    except LookupError:
+        codec = "cp1252"
+    raw = _strip_rtf_groups(raw)
+
+    out: list[str] = []
+    pending = bytearray()
+
+    def flush() -> None:
+        if pending:
+            out.append(pending.decode(codec, "replace"))
+            pending.clear()
+
+    i, n = 0, len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == "{":
+            i += 1
+            continue
+        if ch == "}":
+            flush()
+            i += 1
+            continue
+        if ch == "\\":
+            if i + 1 >= n:
+                break
+            nxt = raw[i + 1]
+            if nxt in "\\{}":
+                flush()
+                out.append(nxt)
+                i += 2
+                continue
+            if nxt == "'":
+                try:
+                    pending.append(int(raw[i + 2:i + 4], 16))
+                except ValueError:
+                    pass
+                i += 4
+                continue
+            control = re.match(r"([A-Za-z]+)(-?\d+)? ?", raw[i + 1:])
+            flush()
+            if control:
+                word = control.group(1).lower()
+                number = control.group(2)
+                i += 1 + len(control.group(0))
+                if word in ("par", "line"):
+                    out.append("\n")
+                elif word == "tab":
+                    out.append("\t")
+                elif word == "u" and number:
+                    try:
+                        code = int(number)
+                    except ValueError:
+                        code = 0
+                    if code < 0:
+                        code += 65536
+                    out.append(chr(code))
+                    if i < n and raw[i] == "?":
+                        i += 1
+                elif word == "bullet":
+                    out.append("•")
+                elif word == "emdash":
+                    out.append("—")
+                elif word == "endash":
+                    out.append("–")
+                elif word in ("lquote", "ldblquote"):
+                    out.append("“")
+                elif word in ("rquote", "rdblquote"):
+                    out.append("”")
+                continue
+            i += 2
+            continue
+        if ch in "\r\n":
+            flush()
+            i += 1
+            continue
+        flush()
+        out.append(ch)
+        i += 1
+    flush()
+    text = re.sub(r"[ \t]+\n", "\n", "".join(out))
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _render_rtf(data: bytes, filename: str) -> dict:
+    text = _rtf_to_text(data)
+    if not text:
+        body = '<p class="notice-inline">RTF 正文为空或无法解析。</p>'
+    else:
+        body = '<div class="plain-text">' + html.escape(text) + "</div>"
+    counts = {"paragraphs": text.count("\n") + 1 if text else 0}
+    return _result("rtf", _stem(filename) or "RTF 文档", body, text, counts)
+
+
+# ---------------------------------------------------------------- CSV / TSV
+
+def _decode_text(data: bytes) -> str:
+    for encoding in ("utf-8-sig", "gb18030", "cp1252"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def _sniff_delimiter(sample: str) -> str:
+    best, best_count = ",", -1
+    for delimiter in (",", ";", "\t", "|"):
+        count = sample.count(delimiter)
+        if count > best_count:
+            best, best_count = delimiter, count
+    return best
+
+
+def _render_csv(data: bytes, filename: str, rows: int, cols: int) -> dict:
+    text = _decode_text(data)
+    delimiter = "\t" if _ext(filename) == "tsv" else _sniff_delimiter(text[:8192])
+    parsed: list[list[str]] = []
+    truncated = False
+    for record in csv.reader(io.StringIO(text), delimiter=delimiter):
+        if len(parsed) >= rows:
+            truncated = True
+            break
+        if len(record) > cols:
+            truncated = True
+            record = record[:cols]
+        parsed.append(record)
+    rows_html: list[str] = []
+    for index, record in enumerate(parsed):
+        tag = "th" if index == 0 else "td"
+        cells = "".join(f"<{tag}>{html.escape(cell)}</{tag}>" for cell in record)
+        rows_html.append(f"<tr>{cells}</tr>")
+    body = ('<table class="doc-table"><tbody>' + "".join(rows_html) + "</tbody></table>"
+            if rows_html else '<p class="notice-inline">文件为空。</p>')
+    warnings = ["表格行列超出上限，已截断"] if truncated else []
+    counts = {"rows": len(parsed), "cols": max((len(r) for r in parsed), default=0)}
+    text_out = "\n".join(delimiter.join(record) for record in parsed)
+    kind = "tsv" if _ext(filename) == "tsv" else "csv"
+    return _result(kind, _stem(filename) or kind.upper() + " 文件", body, text_out,
+                   counts, warnings)
+
+
+def _pdf_result(data: bytes, filename: str) -> dict:
+    body = ('<div class="notice"><h2>PDF 文档</h2>'
+            "<p>该文件由浏览器原生 PDF 查看器直接打开。</p></div>")
+    return _result("pdf", _stem(filename) or "PDF 文档", body, "",
+                   {"bytes": len(data)}, ["PDF 由浏览器原生查看器渲染"])
+
+
 # ---------------------------------------------------------------- 对外入口
 
 def render_document(data: bytes, filename: str = "", media_prefix: str = "",
@@ -1287,6 +1929,12 @@ def render_document(data: bytes, filename: str = "", media_prefix: str = "",
         max_table_rows, max_table_cols, max_slides, max_decompressed)
 
     kind = detect_kind(data, filename)
+    if kind == "pdf":
+        return _pdf_result(data, filename)
+    if kind == "rtf":
+        return _render_rtf(data, filename)
+    if kind in CSV_EXTS:
+        return _render_csv(data, filename, rows, cols)
     if kind in LEGACY_FORMATS:
         return _unsupported_result(kind, filename)
     if kind not in SUPPORTED_FORMATS:
@@ -1297,7 +1945,13 @@ def render_document(data: bytes, filename: str = "", media_prefix: str = "",
             return _render_docx(archive, filename, media_prefix)
         if kind == "xlsx":
             return _render_xlsx(archive, filename, rows, cols)
-        return _render_pptx(archive, filename, slides_limit)
+        if kind == "pptx":
+            return _render_pptx(archive, filename, slides_limit)
+        if kind == "odt":
+            return _render_odt(archive, filename, rows, cols, media_prefix)
+        if kind == "ods":
+            return _render_ods(archive, filename, rows, cols)
+        return _render_odp(archive, filename, slides_limit, media_prefix)
 
 
 def extract_text(data: bytes, filename: str = "",
@@ -1306,6 +1960,8 @@ def extract_text(data: bytes, filename: str = "",
     """只抽取纯文本（用于复制/检索/降级展示）。"""
     result = render_document(data, filename, "", max_table_rows, max_table_cols,
                              max_slides, max_decompressed)
+    if result["kind"] == "pdf":
+        raise ValueError("PDF 为二进制格式，请使用预览页打开")
     if not result["text"] and result["kind"] not in SUPPORTED_FORMATS:
         raise ValueError("该格式暂不支持在线查看，请下载后打开")
     return result["text"]

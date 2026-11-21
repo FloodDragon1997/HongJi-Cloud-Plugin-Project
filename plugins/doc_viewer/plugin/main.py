@@ -1,7 +1,8 @@
 """文档查看能力插件（type=capability）。
 
-职责：把 Office Open XML 文档（docx / xlsx / pptx）解析为可安全内联的 HTML，
-供平台在线预览；旧版二进制 Office 格式给出下载引导。
+职责：把 docx / xlsx / pptx / odt / ods / odp / rtf / csv / tsv 解析为可安全内联的
+HTML，供平台在线预览；PDF 交由浏览器原生查看器直出；旧版二进制 Office 格式给出
+下载引导。
 
 - 本模块是注册进 PluginRegistry 的能力插件，业务侧以
   ``registry.create("doc_viewer", config)`` 取实例后调用；
@@ -79,13 +80,13 @@ class DocViewerPlugin:
          "hint": f"文档 zip 解压总量上限；取值 1–{MAX_DECOMPRESSED_LIMIT // _MB}"},
         {"key": "max_table_rows", "label": "表格最大行数", "type": "number",
          "placeholder": str(DEFAULT_MAX_TABLE_ROWS),
-         "hint": f"Excel 单表展示行数上限；取值 1–{MAX_TABLE_ROWS_LIMIT}"},
+         "hint": f"表格单表展示行数上限；取值 1–{MAX_TABLE_ROWS_LIMIT}"},
         {"key": "max_table_cols", "label": "表格最大列数", "type": "number",
          "placeholder": str(DEFAULT_MAX_TABLE_COLS),
-         "hint": f"Excel 单表展示列数上限；取值 1–{MAX_TABLE_COLS_LIMIT}"},
+         "hint": f"表格单表展示列数上限；取值 1–{MAX_TABLE_COLS_LIMIT}"},
         {"key": "max_slides", "label": "最大幻灯片数", "type": "number",
          "placeholder": str(DEFAULT_MAX_SLIDES),
-         "hint": f"PPTX 展示页数上限；取值 1–{MAX_SLIDES_LIMIT}"},
+         "hint": f"演示文稿展示页数上限；取值 1–{MAX_SLIDES_LIMIT}"},
     ]
 
     def __init__(self, config: dict | None = None):

@@ -62,6 +62,7 @@ from doc_viewer_core import (  # noqa: E402
     MAX_TABLE_ROWS_LIMIT,
     MEDIA_MIMES,
     SUPPORTED_FORMATS,
+    detect_kind,
     extract_media,
     render_document,
 )
@@ -86,6 +87,13 @@ _KIND_LABELS = {
     "docx": "Word 文档",
     "xlsx": "Excel 工作簿",
     "pptx": "PowerPoint 演示文稿",
+    "pdf": "PDF 文档",
+    "odt": "OpenDocument 文本",
+    "ods": "OpenDocument 表格",
+    "odp": "OpenDocument 演示",
+    "rtf": "RTF 文档",
+    "csv": "CSV 表格",
+    "tsv": "TSV 表格",
 }
 
 router = APIRouter(prefix="/api/doc_viewer", tags=["plugin-doc-viewer"])
@@ -222,10 +230,23 @@ def view_endpoint(
     request: Request,
     user: CurrentUser,
     name: str | None = Query(default=None, max_length=512, description="文件名（含扩展名）"),
-) -> HTMLResponse:
+) -> Response:
     """安全 HTML 预览页：正文由核心转义生成，CSP 禁止脚本执行。"""
     filename = (name or "").strip()
     data = _fetch_document(request, file_id)
+    if detect_kind(data, filename) == "pdf":
+        # PDF 交给浏览器原生查看器，直接内联原始字节（禁止 MIME 嗅探）
+        download_name = urllib.parse.quote(
+            (filename or "document.pdf").rsplit("/", 1)[-1])
+        return Response(
+            content=data,
+            media_type="application/pdf",
+            headers={
+                "X-Content-Type-Options": "nosniff",
+                "Content-Disposition": f"inline; filename*=UTF-8''{download_name}",
+                "Cache-Control": "private, max-age=60",
+            },
+        )
     try:
         result = render_document(
             data, filename,
@@ -257,6 +278,8 @@ def text_endpoint(
         result = render_document(data, (name or "").strip())
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
+    if result["kind"] == "pdf":
+        raise HTTPException(422, detail="PDF 为二进制格式，请使用预览页打开")
     if result["kind"] not in SUPPORTED_FORMATS:
         raise HTTPException(422, detail="该格式暂不支持在线查看，请下载后打开")
 
@@ -336,6 +359,10 @@ margin:1.1em 0 .45em;line-height:1.35;font-weight:600;color:#111827}
 .doc table.doc-table th,.doc table.doc-table td{
 border:1px solid #d8dee4;padding:6px 10px;vertical-align:top;text-align:left}
 .doc table.doc-table th{background:#f3f5f7;font-weight:600}
+.doc .plain-text{white-space:pre-wrap;overflow-wrap:anywhere;margin:0;padding:16px 18px;
+border:1px solid #e3e6ea;border-radius:8px;background:#f8fafc;
+font:13.5px/1.7 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace}
+.doc ul.odf-list{margin:.2em 0 .8em;padding-left:1.4em}
 .sheet{margin-bottom:36px}
 .sheet:last-child{margin-bottom:0}
 .sheet h2{margin:0 0 12px;font-size:16px;color:#1f2328}

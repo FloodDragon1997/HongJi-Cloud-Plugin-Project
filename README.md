@@ -80,7 +80,7 @@ from my_helpers import helper  # noqa: E402
 | `ocr` | capability | OCR 文字识别（`auto` 优先 Tesseract，其次 RapidOCR/PP-OCR，缺失时降级占位） | 可选 pytesseract+Tesseract / rapidocr+onnxruntime / PyMuPDF（PDF） |
 | `thumbnail` | capability | 缩略图生成（`auto` 优先 Pillow 真实缩放，未安装自动降级占位） | 可选 Pillow |
 | `preview` | capability | 在线预览类型判定与内容协商 | 无 |
-| `doc_viewer` | capability | 文档在线查看（DOCX/XLSX/PPTX 安全渲染，旧版 Office 格式下载引导；含 `routes` 预览页/纯文本/图片端点） | 无（标准库） |
+| `doc_viewer` | capability | 文档在线查看（DOCX/XLSX/PPTX/ODT/ODS/ODP/RTF/CSV/TSV 安全渲染，PDF 原生直出，旧版 Office 格式下载引导；含 `routes` 预览页/纯文本/图片端点） | 无（标准库） |
 | `archive` | capability | 压缩包条目浏览、iframe 预览页与 zip 打包（含 `routes` 端点，防 Zip Slip 与压缩炸弹） | 无（标准库） |
 
 > 这些插件与平台内置插件同 `id`。平台启动时会把内置插件同步进插件表，因此直接上传同 `id`
