@@ -24,6 +24,9 @@
 | GET | `/api/doc_viewer/{file_id}/text?name=文件名` | 纯文本抽取，`text/plain; charset=utf-8` |
 | GET | `/api/doc_viewer/{file_id}/media?name=包内图片路径` | 文档内嵌图片（仅 png/jpg/jpeg/gif/bmp/webp） |
 
+右键菜单的「查看文档」通过 `ui.actions.extensions`（`docx`/`xlsx`/`pptx`）限定，
+仅在对应后缀的文件上展示，目录与其他类型文件不显示。
+
 `view` 端点通过当前请求的会话凭据（Cookie / Bearer）反向调用平台文件下载接口获取
 文件字节，候选路径为 `/api/files/{file_id}/download`、`/content`、`/raw`，404/405
 时依次回退。路径不同时可用环境变量覆盖：

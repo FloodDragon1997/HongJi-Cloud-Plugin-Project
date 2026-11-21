@@ -13,7 +13,8 @@
     ],
     "actions": [
       {"label": "查看压缩包", "path": "/api/archive/{file_id}/view", "method": "GET",
-       "description": "在独立窗口浏览压缩包条目列表", "scope": "file", "result": "open"}
+       "description": "在独立窗口浏览压缩包条目列表", "scope": "file", "result": "open",
+       "extensions": ["zip", "tar", "gz", "tgz", "bz2", "xz"]}
     ]
   },
   "config_schema": [

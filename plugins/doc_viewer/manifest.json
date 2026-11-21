@@ -26,7 +26,7 @@
     "actions": [
       {"label": "查看文档", "path": "/api/doc_viewer/{file_id}/view?name={file_name}",
        "method": "GET", "description": "在独立窗口打开文档预览", "scope": "file",
-       "result": "open"}
+       "result": "open", "extensions": ["docx", "xlsx", "pptx"]}
     ]
   },
   "config_schema": [
