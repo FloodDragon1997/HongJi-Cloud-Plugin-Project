@@ -38,6 +38,8 @@ DEFAULT_MAX_DECOMPRESSED = 64 * 1024 * 1024
 MAX_DECOMPRESSED_LIMIT = 256 * 1024 * 1024
 MAX_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_MEDIA_BYTES = 16 * 1024 * 1024
+#: 纯文本类格式（RTF/CSV/TSV）单次解码上限，避免超大文本撑高内存与解析耗时
+MAX_TEXT_BYTES = 8 * 1024 * 1024
 
 DEFAULT_MAX_TABLE_ROWS = 500
 MAX_TABLE_ROWS_LIMIT = 5000
@@ -209,7 +211,12 @@ def _read_member(archive: zipfile.ZipFile, name: str,
         return None
     if info.file_size > max_bytes:
         raise ValueError(f"文档内部条目 {name} 过大，无法在线查看")
-    return archive.read(info)
+    # 以实际解压字节为准再校验一次，避免条目头声明的大小与实际不符
+    with archive.open(info) as stream:
+        raw = stream.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(f"文档内部条目 {name} 过大，无法在线查看")
+    return raw
 
 
 def _load_xml(archive: zipfile.ZipFile, name: str):
@@ -1853,13 +1860,15 @@ def _rtf_to_text(data: bytes) -> str:
 
 
 def _render_rtf(data: bytes, filename: str) -> dict:
-    text = _rtf_to_text(data)
+    clipped = len(data) > MAX_TEXT_BYTES
+    text = _rtf_to_text(data[:MAX_TEXT_BYTES])
     if not text:
         body = '<p class="notice-inline">RTF 正文为空或无法解析。</p>'
     else:
         body = '<div class="plain-text">' + html.escape(text) + "</div>"
     counts = {"paragraphs": text.count("\n") + 1 if text else 0}
-    return _result("rtf", _stem(filename) or "RTF 文档", body, text, counts)
+    warnings = ["RTF 内容过大，仅解析前 8MB"] if clipped else []
+    return _result("rtf", _stem(filename) or "RTF 文档", body, text, counts, warnings)
 
 
 # ---------------------------------------------------------------- CSV / TSV
@@ -1883,7 +1892,8 @@ def _sniff_delimiter(sample: str) -> str:
 
 
 def _render_csv(data: bytes, filename: str, rows: int, cols: int) -> dict:
-    text = _decode_text(data)
+    clipped = len(data) > MAX_TEXT_BYTES
+    text = _decode_text(data[:MAX_TEXT_BYTES])
     delimiter = "\t" if _ext(filename) == "tsv" else _sniff_delimiter(text[:8192])
     parsed: list[list[str]] = []
     truncated = False
@@ -1902,7 +1912,11 @@ def _render_csv(data: bytes, filename: str, rows: int, cols: int) -> dict:
         rows_html.append(f"<tr>{cells}</tr>")
     body = ('<table class="doc-table"><tbody>' + "".join(rows_html) + "</tbody></table>"
             if rows_html else '<p class="notice-inline">文件为空。</p>')
-    warnings = ["表格行列超出上限，已截断"] if truncated else []
+    warnings = []
+    if clipped:
+        warnings.append("文本内容过大，仅解析前 8MB")
+    if truncated:
+        warnings.append("表格行列超出上限，已截断")
     counts = {"rows": len(parsed), "cols": max((len(r) for r in parsed), default=0)}
     text_out = "\n".join(delimiter.join(record) for record in parsed)
     kind = "tsv" if _ext(filename) == "tsv" else "csv"

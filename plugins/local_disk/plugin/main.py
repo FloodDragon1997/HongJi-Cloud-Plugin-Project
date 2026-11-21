@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -21,6 +20,9 @@ from app.sdk.store_plugin import (
     PutResult,
     StoragePlugin,
 )
+
+CHUNK = 8 * 1024 * 1024
+MAX_KEY_LENGTH = 4096
 
 
 class LocalDiskPlugin(StoragePlugin):
@@ -43,9 +45,17 @@ class LocalDiskPlugin(StoragePlugin):
 
     # --- 路径安全 ---
     def _resolve(self, key: str) -> Path:
+        if not key or len(key) > MAX_KEY_LENGTH or "\x00" in key:
+            raise ValueError(f"非法对象键: {key!r}")
+        if any(ord(ch) < 32 for ch in key):
+            raise ValueError(f"非法对象键（含控制字符）: {key!r}")
         candidate = (self.root / key).resolve()
-        if not str(candidate).startswith(str(self.root) + os.sep) and candidate != self.root:
-            raise ValueError(f"非法对象键（目录穿越）: {key}")
+        try:
+            candidate.relative_to(self.root)
+        except ValueError:
+            raise ValueError(f"非法对象键（目录穿越）: {key}") from None
+        if candidate == self.root:
+            raise ValueError(f"非法对象键: {key!r}")
         return candidate
 
     def _ensure_writable(self) -> None:
@@ -145,7 +155,10 @@ class LocalDiskPlugin(StoragePlugin):
             raise PluginUnavailable(f"本地磁盘读取失败: {exc}") from exc
 
     def exists(self, key: str) -> bool:
-        return self._resolve(key).is_file()
+        try:
+            return self._resolve(key).is_file()
+        except OSError as exc:
+            raise PluginUnavailable(f"本地磁盘读取失败: {exc}") from exc
 
     def delete(self, key: str) -> None:
         self._ensure_writable()
@@ -161,13 +174,19 @@ class LocalDiskPlugin(StoragePlugin):
         if not src.is_file():
             raise PluginObjectNotFound(src_key)
         dst = self._resolve(dst_key)
+        md5 = hashlib.md5()
+        size = 0
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src, dst)
+            # 边复制边算 MD5，避免复制完成后再全量读一遍取 etag
+            with open(src, "rb") as reader, open(dst, "wb") as writer:
+                while chunk := reader.read(CHUNK):
+                    writer.write(chunk)
+                    md5.update(chunk)
+                    size += len(chunk)
         except OSError as exc:
             raise PluginUnavailable(f"本地磁盘复制失败: {exc}") from exc
-        stat = self.stat(dst_key)
-        return PutResult(key=dst_key, size=stat["size"], etag=stat["etag"])
+        return PutResult(key=dst_key, size=size, etag=md5.hexdigest())
 
     def walk_objects(self):
         """遍历数据根目录下全部对象键（对账用扩展，非契约方法）。"""

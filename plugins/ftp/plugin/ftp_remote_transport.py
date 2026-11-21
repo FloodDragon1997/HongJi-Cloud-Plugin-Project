@@ -1,11 +1,10 @@
-"""远程存储传输层（AIC-015-2）：WebDAV / FTP 协议适配。
+"""FTP 存储传输层。
 
-设计：插件只依赖 Transport 协议（put/get/stat/delete/list/copy/probe）。
+插件只依赖 Transport 协议（put/get/stat/stat_size/delete/copy/probe）。
 - MemoryTransport：内存实现，用于契约测试与本地演示，零外部依赖。
-- WebDavTransport：基于标准库 urllib 的 WebDAV（PUT/GET/HEAD/MKCOL/DELETE/COPY）。
 - FtpTransport：基于标准库 ftplib 的 FTP（STOR/RETR/SIZE/DELE）。
 
-不引入未批准的大依赖；真实服务连接参数由存储源配置加密落库后注入。
+模块名带 ftp_ 前缀，避免与 webdav 插件在同进程装载时发生模块名冲突。
 """
 
 from __future__ import annotations
@@ -32,6 +31,7 @@ class Transport(Protocol):
     def put(self, key: str, data: bytes, readonly: bool = False) -> None: ...
     def get(self, key: str) -> bytes: ...
     def stat(self, key: str) -> tuple[int, str]: ...  # (size, md5)
+    def stat_size(self, key: str) -> int: ...
     def exists(self, key: str) -> bool: ...
     def delete(self, key: str) -> None: ...
     def copy(self, src: str, dst: str) -> None: ...
@@ -39,8 +39,6 @@ class Transport(Protocol):
 
     # --- 可选真流式能力 ---
     # 未实现的 Transport 保持旧语义（基类回退到 put()/get()+切片）。
-    # 默认实现抛 NotImplementedError，仅用于显式继承本 Protocol 的场景；
-    # 基类用 getattr/hasattr 探测能力，不依赖 isinstance 判定。
     def write_stream(self, key: str, fileobj: BinaryIO,
                      readonly: bool = False) -> int:
         """从 fileobj 流式写对象，返回写入字节数；不支持请保持未实现。"""
@@ -73,10 +71,16 @@ class MemoryTransport:
 
     def stat(self, key: str) -> tuple[int, str]:
         with self._lock:
+            blob = self._data.get(key)
+        if blob is None:
+            raise RemoteObjectNotFound(key)
+        return len(blob), hashlib.md5(blob).hexdigest()
+
+    def stat_size(self, key: str) -> int:
+        with self._lock:
             if key not in self._data:
                 raise RemoteObjectNotFound(key)
-            blob = self._data[key]
-            return len(blob), hashlib.md5(blob).hexdigest()
+            return len(self._data[key])
 
     def exists(self, key: str) -> bool:
         with self._lock:
@@ -126,181 +130,6 @@ class MemoryTransport:
         return total
 
 
-class WebDavTransport:
-    """WebDAV 传输（标准库 urllib，支持 Basic/Digest 之外的 Bearer/Basic）。
-
-    配置：url（WebDAV 根）、username、password、token、readonly。
-    """
-
-    def __init__(self, config: dict):
-        self.base = (config.get("url") or "").rstrip("/")
-        if not self.base:
-            raise RemoteUnavailable("WebDAV 配置缺少 url")
-        self.username = config.get("username") or ""
-        self.password = config.get("password") or ""
-        self.token = config.get("token") or ""
-        self.readonly = bool(config.get("readonly", False))
-
-    def _url(self, key: str) -> str:
-        return f"{self.base}/{key.lstrip('/')}"
-
-    def _headers(self) -> dict:
-        h = {}
-        if self.token:
-            h["Authorization"] = f"Bearer {self.token}"
-        elif self.username:
-            import base64
-            cred = base64.b64encode(f"{self.username}:{self.password}".encode()).decode()
-            h["Authorization"] = f"Basic {cred}"
-        return h
-
-    def _request(self, method: str, key: str, data: bytes | None = None) -> tuple[int, bytes, dict]:
-        import urllib.error
-        import urllib.request
-
-        req = urllib.request.Request(self._url(key), data=data, method=method, headers=self._headers())
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return resp.status, resp.read(), dict(resp.headers)
-        except urllib.error.HTTPError as exc:
-            if exc.code in (404, 410):
-                raise RemoteObjectNotFound(key) from exc
-            raise RemoteUnavailable(f"WebDAV {method} 失败: HTTP {exc.code}") from exc
-        except Exception as exc:  # noqa: BLE001
-            raise RemoteUnavailable(f"WebDAV {method} 失败: {exc}") from exc
-
-    def put(self, key: str, data: bytes, readonly: bool = False) -> None:
-        if self.readonly or readonly:
-            raise RemoteUnavailable("WebDAV 存储为只读模式")
-        self._request("PUT", key, data)
-
-    def get(self, key: str) -> bytes:
-        return self._request("GET", key)[1]
-
-    def write_stream(self, key: str, fileobj: BinaryIO,
-                     readonly: bool = False) -> int:
-        """真流式 PUT：分块生成器作为请求体（urllib 自动启用 chunked），
-        峰值内存恒为单块 STREAM_CHUNK，不整对象入内存。"""
-        if self.readonly or readonly:
-            raise RemoteUnavailable("WebDAV 存储为只读模式")
-        import urllib.error
-        import urllib.request
-
-        total = 0
-
-        def _body():
-            nonlocal total
-            while True:
-                chunk = fileobj.read(STREAM_CHUNK)
-                if not chunk:
-                    break
-                total += len(chunk)
-                yield chunk
-
-        req = urllib.request.Request(
-            self._url(key), data=_body(), method="PUT", headers=self._headers())
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                resp.read()
-        except urllib.error.HTTPError as exc:
-            if exc.code in (404, 410):
-                raise RemoteObjectNotFound(key) from exc
-            raise RemoteUnavailable(f"WebDAV PUT 失败: HTTP {exc.code}") from exc
-        except Exception as exc:  # noqa: BLE001
-            raise RemoteUnavailable(f"WebDAV PUT 失败: {exc}") from exc
-        return total
-
-    def read_into(self, key: str, fileobj: BinaryIO) -> int:
-        """真流式 GET：响应体按 STREAM_CHUNK 逐块写出，不整对象入内存。"""
-        import urllib.error
-        import urllib.request
-
-        req = urllib.request.Request(self._url(key), method="GET", headers=self._headers())
-        total = 0
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                while True:
-                    chunk = resp.read(STREAM_CHUNK)
-                    if not chunk:
-                        break
-                    fileobj.write(chunk)
-                    total += len(chunk)
-        except urllib.error.HTTPError as exc:
-            if exc.code in (404, 410):
-                raise RemoteObjectNotFound(key) from exc
-            raise RemoteUnavailable(f"WebDAV GET 失败: HTTP {exc.code}") from exc
-        except Exception as exc:  # noqa: BLE001
-            raise RemoteUnavailable(f"WebDAV GET 失败: {exc}") from exc
-        return total
-
-    def stat(self, key: str) -> tuple[int, str]:
-        """流式计算 size 与 MD5：逐块读响应体，内存峰值 ≤ STREAM_CHUNK。"""
-        import urllib.error
-        import urllib.request
-
-        req = urllib.request.Request(self._url(key), method="GET", headers=self._headers())
-        md5 = hashlib.md5()
-        size = 0
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                while True:
-                    chunk = resp.read(STREAM_CHUNK)
-                    if not chunk:
-                        break
-                    md5.update(chunk)
-                    size += len(chunk)
-        except urllib.error.HTTPError as exc:
-            if exc.code in (404, 410):
-                raise RemoteObjectNotFound(key) from exc
-            raise RemoteUnavailable(f"WebDAV GET 失败: HTTP {exc.code}") from exc
-        except Exception as exc:  # noqa: BLE001
-            raise RemoteUnavailable(f"WebDAV GET 失败: {exc}") from exc
-        return size, md5.hexdigest()
-
-    def exists(self, key: str) -> bool:
-        try:
-            self._request("HEAD", key)
-            return True
-        except RemoteObjectNotFound:
-            return False
-
-    def delete(self, key: str) -> None:
-        if self.readonly:
-            raise RemoteUnavailable("WebDAV 存储为只读模式")
-        self._request("DELETE", key)
-
-    def copy(self, src: str, dst: str) -> None:
-        if self.readonly:
-            raise RemoteUnavailable("WebDAV 存储为只读模式")
-        import urllib.error
-        import urllib.request
-
-        req = urllib.request.Request(self._url(src), method="COPY", headers={
-            **self._headers(), "Destination": self._url(dst), "Overwrite": "T",
-        })
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                resp.read()
-        except urllib.error.HTTPError as exc:
-            if exc.code in (404, 409):
-                raise RemoteObjectNotFound(src) from exc
-            raise RemoteUnavailable(f"WebDAV COPY 失败: HTTP {exc.code}") from exc
-        except Exception as exc:  # noqa: BLE001
-            raise RemoteUnavailable(f"WebDAV COPY 失败: {exc}") from exc
-
-    def probe(self) -> tuple[bool, bool, str]:
-        import urllib.error
-        import urllib.request
-
-        req = urllib.request.Request(self.base, method="OPTIONS", headers=self._headers())
-        try:
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                allow = resp.headers.get("DAV", "")
-                return bool(allow), not self.readonly, "WebDAV reachable"
-        except Exception as exc:  # noqa: BLE001
-            return False, False, f"WebDAV 不可达: {exc}"
-
-
 class FtpTransport:
     """FTP 传输（标准库 ftplib，被动模式）。
 
@@ -308,18 +137,20 @@ class FtpTransport:
     """
 
     def __init__(self, config: dict):
-        self.host = config.get("host") or ""
+        self.host = (config.get("host") or "").strip()
         if not self.host:
             raise RemoteUnavailable("FTP 配置缺少 host")
-        self.port = int(config.get("port") or 21)
+        try:
+            self.port = int(config.get("port") or 21)
+        except (TypeError, ValueError) as exc:
+            raise RemoteUnavailable(f"FTP 端口非法: {config.get('port')!r}") from exc
         self.username = config.get("username") or "anonymous"
         self.password = config.get("password") or ""
-        self.base = (config.get("base") or "").rstrip("/")
+        self.base = (config.get("base") or "").strip().rstrip("/")
         self.readonly = bool(config.get("readonly", False))
 
     def _path(self, key: str) -> str:
-        clean = "/".join(seg for seg in key.split("/") if seg not in ("", ".", ".."))
-        return f"{self.base}/{clean}".replace("//", "/")
+        return f"{self.base}/{key.lstrip('/')}".replace("//", "/")
 
     def _connect(self):
         import ftplib
@@ -333,21 +164,19 @@ class FtpTransport:
         except Exception as exc:  # noqa: BLE001
             raise RemoteUnavailable(f"FTP 连接失败: {exc}") from exc
 
-    def put(self, key: str, data: bytes, readonly: bool = False) -> None:
-        if self.readonly or readonly:
-            raise RemoteUnavailable("FTP 存储为只读模式")
-        ftp = self._connect()
+    @staticmethod
+    def _quit(ftp) -> None:
         try:
-            self._mkdirs(ftp, self._path(key))
-            with ftp.storbinary(f"STOR {self._path(key)}", io.BytesIO(data)):
-                pass
-        finally:
             ftp.quit()
+        except Exception:  # noqa: BLE001
+            try:
+                ftp.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _mkdirs(self, ftp, path: str) -> None:
-        parts = path.split("/")
         current = ""
-        for part in parts[:-1]:
+        for part in path.split("/")[:-1]:
             if not part:
                 continue
             current = f"{current}/{part}" if current else part
@@ -359,6 +188,21 @@ class FtpTransport:
                 except Exception:  # noqa: BLE001
                     pass
 
+    def put(self, key: str, data: bytes, readonly: bool = False) -> None:
+        if self.readonly or readonly:
+            raise RemoteUnavailable("FTP 存储为只读模式")
+        ftp = self._connect()
+        try:
+            path = self._path(key)
+            self._mkdirs(ftp, path)
+            ftp.storbinary(f"STOR {path}", io.BytesIO(data))
+        except RemoteUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise RemoteUnavailable(f"FTP 写入失败: {exc}") from exc
+        finally:
+            self._quit(ftp)
+
     def get(self, key: str) -> bytes:
         ftp = self._connect()
         try:
@@ -369,7 +213,7 @@ class FtpTransport:
                 raise RemoteObjectNotFound(key) from exc
             return buf.getvalue()
         finally:
-            ftp.quit()
+            self._quit(ftp)
 
     def write_stream(self, key: str, fileobj: BinaryIO,
                      readonly: bool = False) -> int:
@@ -384,11 +228,16 @@ class FtpTransport:
             size += len(block)
 
         try:
-            self._mkdirs(ftp, self._path(key))
-            ftp.storbinary(f"STOR {self._path(key)}", fileobj, callback=_count)
+            path = self._path(key)
+            self._mkdirs(ftp, path)
+            ftp.storbinary(f"STOR {path}", fileobj, callback=_count)
             return size
+        except RemoteUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise RemoteUnavailable(f"FTP 写入失败: {exc}") from exc
         finally:
-            ftp.quit()
+            self._quit(ftp)
 
     def read_into(self, key: str, fileobj: BinaryIO) -> int:
         """真流式 RETR：retrbinary 的块直接写入 fileobj，不整对象入内存。"""
@@ -407,7 +256,7 @@ class FtpTransport:
                 raise RemoteObjectNotFound(key) from exc
             return total
         finally:
-            ftp.quit()
+            self._quit(ftp)
 
     def stat(self, key: str) -> tuple[int, str]:
         """流式计算 size 与 MD5：retrbinary 逐块喂入哈希器，不整对象入内存。"""
@@ -427,18 +276,31 @@ class FtpTransport:
                 raise RemoteObjectNotFound(key) from exc
             return size, md5.hexdigest()
         finally:
-            ftp.quit()
+            self._quit(ftp)
+
+    def stat_size(self, key: str) -> int:
+        """轻量取大小：优先 SIZE 命令，避免为了 size 全量下载对象。"""
+        ftp = self._connect()
+        try:
+            try:
+                size = ftp.size(self._path(key))
+            except Exception as exc:  # noqa: BLE001
+                raise RemoteObjectNotFound(key) from exc
+            if size is None:
+                raise RemoteObjectNotFound(key)
+            return int(size)
+        finally:
+            self._quit(ftp)
 
     def exists(self, key: str) -> bool:
         ftp = self._connect()
         try:
             try:
-                size = ftp.size(self._path(key))
-                return size is not None
+                return ftp.size(self._path(key)) is not None
             except Exception:  # noqa: BLE001
                 return False
         finally:
-            ftp.quit()
+            self._quit(ftp)
 
     def delete(self, key: str) -> None:
         if self.readonly:
@@ -450,25 +312,30 @@ class FtpTransport:
             except Exception:  # noqa: BLE001
                 pass  # 幂等
         finally:
-            ftp.quit()
+            self._quit(ftp)
 
     def copy(self, src: str, dst: str) -> None:
         """服务端无 COPY 命令：用两条连接做流式中转，内存峰值 ≤ STREAM_CHUNK。"""
         if self.readonly:
             raise RemoteUnavailable("FTP 存储为只读模式")
         src_ftp = self._connect()
-        dst_ftp = self._connect()
+        try:
+            dst_ftp = self._connect()
+        except Exception:
+            self._quit(src_ftp)
+            raise
         src_conn = None
         dst_conn = None
         try:
-            self._mkdirs(dst_ftp, self._path(dst))
+            dst_path = self._path(dst)
+            self._mkdirs(dst_ftp, dst_path)
             src_ftp.voidcmd("TYPE I")
             try:
                 src_conn, _ = src_ftp.transfercmd(f"RETR {self._path(src)}")
             except Exception as exc:  # noqa: BLE001
                 raise RemoteObjectNotFound(src) from exc
             dst_ftp.voidcmd("TYPE I")
-            dst_conn = dst_ftp.transfercmd(f"STOR {self._path(dst)}")
+            dst_conn = dst_ftp.transfercmd(f"STOR {dst_path}")
             while True:
                 block = src_conn.recv(STREAM_CHUNK)
                 if not block:
@@ -488,10 +355,7 @@ class FtpTransport:
                     except Exception:  # noqa: BLE001
                         pass
             for ftp in (src_ftp, dst_ftp):
-                try:
-                    ftp.quit()
-                except Exception:  # noqa: BLE001
-                    pass
+                self._quit(ftp)
 
     def probe(self) -> tuple[bool, bool, str]:
         ftp = self._connect()
@@ -501,7 +365,4 @@ class FtpTransport:
         except Exception as exc:  # noqa: BLE001
             return False, False, f"FTP 不可用: {exc}"
         finally:
-            try:
-                ftp.quit()
-            except Exception:  # noqa: BLE001
-                pass
+            self._quit(ftp)

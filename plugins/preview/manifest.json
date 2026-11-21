@@ -1,7 +1,7 @@
 {
   "id": "preview",
   "name": "在线预览插件",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "capability",
   "entry": "plugin/main.py",
   "permissions": ["fs.read"],

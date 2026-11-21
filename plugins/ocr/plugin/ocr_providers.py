@@ -14,11 +14,18 @@ from __future__ import annotations
 import importlib.util
 import re
 import shutil
+from functools import lru_cache
 from typing import Protocol
 
 DEFAULT_MAX_PAGES = 20
 MAX_PAGES = 50
 MAX_TEXT_CHARS = 20000
+#: 占位引擎最多扫描的字节数（避免对超大二进制做全量解码与正则）
+MAX_STUB_SCAN = 1 * 1024 * 1024
+#: 单次识别最多回报的文本块数（防止超大图分配过多内存）
+MAX_BLOCKS = 1000
+#: 单页渲染后的像素上限（防止异常 PDF 页面撑爆内存）
+MAX_PAGE_PIXELS = 40_000_000
 
 
 class OcrProvider(Protocol):
@@ -97,6 +104,10 @@ def _load_pdf_pages(data: bytes, max_pages: int) -> list:
                 if index >= max_pages:
                     break
                 pix = page.get_pixmap(dpi=200)
+                if pix.width * pix.height > MAX_PAGE_PIXELS:
+                    raise ValueError(
+                        f"PDF 第 {index + 1} 页像素过大（{pix.width}×{pix.height}），"
+                        "请降低分辨率或分页识别")
                 pages.append(
                     Image.frombytes("RGB", (pix.width, pix.height), pix.samples))
     except Exception as exc:  # noqa: BLE001
@@ -108,7 +119,10 @@ def _load_pdf_pages(data: bytes, max_pages: int) -> list:
 
 def _build_result(engine: str, language: str, blocks: list,
                   confs: list[tuple[float, int]], pages: int) -> dict:
-    """汇总块结果：按文本长度加权平均置信度，文本总量截断。"""
+    """汇总块结果：按文本长度加权平均置信度，文本总量与块数均设上限。"""
+    if len(blocks) > MAX_BLOCKS:
+        blocks = blocks[:MAX_BLOCKS]
+        confs = confs[:MAX_BLOCKS]
     text = "\n".join(block["text"] for block in blocks)[:MAX_TEXT_CHARS]
     total = sum(length for _, length in confs)
     confidence = round(sum(conf * length for conf, length in confs) / total, 4) if total else 0.0
@@ -147,7 +161,7 @@ class StubOcrProvider:
     def recognize(self, data: bytes, filename: str, mime: str) -> dict:
         # 仅当文件内含可读文本（如文本型 PDF、带说明的图片元数据）时提取
         try:
-            decoded = data.decode("utf-8", errors="ignore")
+            decoded = data[:MAX_STUB_SCAN].decode("utf-8", errors="ignore")
         except Exception:  # noqa: BLE001
             decoded = ""
         # 提取连续可打印片段（≥4 字符），过滤纯二进制噪声
@@ -277,12 +291,12 @@ class TesseractOcrProvider:
                     continue
                 try:
                     raw_conf = float(detail["conf"][index])
+                    key = (detail["block_num"][index], detail["par_num"][index],
+                           detail["line_num"][index])
                 except (KeyError, IndexError, TypeError, ValueError):
                     continue
                 if raw_conf < 0:
                     continue
-                key = (detail["block_num"][index], detail["par_num"][index],
-                       detail["line_num"][index])
                 groups.setdefault(key, []).append((word, raw_conf))
             for words in groups.values():
                 # 连续中文不加空格，西文按词以空格拼接
@@ -296,10 +310,12 @@ class TesseractOcrProvider:
 
 # ------------------------------------------------------------------ 注册表
 
+@lru_cache(maxsize=8)
 def _tesseract_ready() -> bool:
     return _module_available("pytesseract") and shutil.which("tesseract") is not None
 
 
+@lru_cache(maxsize=8)
 def _rapidocr_ready() -> bool:
     return _module_available("rapidocr") and _module_available("onnxruntime")
 

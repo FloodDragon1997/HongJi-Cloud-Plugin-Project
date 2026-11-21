@@ -147,7 +147,7 @@ def _read_capped(resp) -> bytes:
                 raise HTTPException(413, f"文档超过上限 {MAX_DOC_BYTES} 字节，请下载后查看")
         except ValueError:
             pass
-    chunks: list[bytes] = []
+    chunks = bytearray()
     total = 0
     while True:
         chunk = resp.read(_CHUNK)
@@ -156,8 +156,8 @@ def _read_capped(resp) -> bytes:
         total += len(chunk)
         if total > MAX_DOC_BYTES:
             raise HTTPException(413, f"文档超过上限 {MAX_DOC_BYTES} 字节，请下载后查看")
-        chunks.append(chunk)
-    return b"".join(chunks)
+        chunks.extend(chunk)
+    return bytes(chunks)
 
 
 def _credential_headers(request: Request) -> dict:

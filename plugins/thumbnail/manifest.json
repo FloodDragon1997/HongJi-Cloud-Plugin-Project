@@ -1,7 +1,7 @@
 {
   "id": "thumbnail",
   "name": "缩略图生成插件",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "type": "capability",
   "entry": "plugin/main.py",
   "permissions": ["fs.read"],

@@ -49,10 +49,14 @@ class ThumbnailPlugin:
         except (TypeError, ValueError):
             size = DEFAULT_SIZE
         self.default_size = max(MIN_SIZE, min(MAX_SIZE, size))
+        self._provider = None
 
     @property
     def provider(self):
-        return build_provider(self.provider_name)
+        # 复用同一 provider 实例，避免每次调用都重新做可用性判定与构造
+        if self._provider is None:
+            self._provider = build_provider(self.provider_name)
+        return self._provider
 
     def capabilities(self) -> dict:
         return {

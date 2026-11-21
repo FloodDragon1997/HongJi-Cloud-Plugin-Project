@@ -73,7 +73,7 @@ def detect_format(data: bytes, filename: str = "") -> str:
         return "tar.bz2"
     if data[:6] == _XZ_MAGIC:
         return "tar.xz"
-    if len(data) > len(b"ustar") + 257 and data[257:262] == b"ustar":
+    if len(data) >= 262 and data[257:262] == b"ustar":
         return "tar"
     for magic, name in UNSUPPORTED_MAGIC.items():
         if data.startswith(magic):
@@ -231,6 +231,21 @@ def _describe(name_raw: str, size: int, is_dir: bool, mtime, encoded: bool = Fal
     return item
 
 
+def _payload_entry(name: str, payload: bytes, declared_size: int) -> dict:
+    """组装单条目读取结果；zip 与 tar 共用，避免两套分支各写一遍。"""
+    preview = classify_entry(name)
+    return {
+        "name": name,
+        "size": len(payload),
+        "declared_size": int(declared_size or 0),
+        "data": payload,
+        "mime": preview["mime"],
+        "previewable": preview["previewable"],
+        "preview_type": preview["preview_type"],
+        "truncated": len(payload) < declared_size,
+    }
+
+
 # ---------------------------------------------------------------- 读取
 
 def _zip_members(data: bytes, encoding: str, max_entries: int):
@@ -335,21 +350,15 @@ def _collect_zip(data: bytes, filename: str, names: list[str] | None, max_entrie
                 skipped.append({"name": name, "reason": f"累计超过上限 {max_total_bytes} 字节"})
                 truncated = True
                 continue
-            with zf.open(info) as stream:
-                payload = stream.read(max_entry_bytes)
+            try:
+                with zf.open(info) as stream:
+                    payload = stream.read(max_entry_bytes)
+            except Exception as exc:  # noqa: BLE001  单个损坏条目不应中断整包
+                skipped.append({"name": name, "reason": f"条目读取失败: {exc}"})
+                continue
             payload = payload[:max_total_bytes - total]
             total += len(payload)
-            preview = classify_entry(name)
-            entries.append({
-                "name": name,
-                "size": len(payload),
-                "declared_size": int(info.file_size or 0),
-                "data": payload,
-                "mime": preview["mime"],
-                "previewable": preview["previewable"],
-                "preview_type": preview["preview_type"],
-                "truncated": len(payload) < info.file_size,
-            })
+            entries.append(_payload_entry(name, payload, info.file_size))
     finally:
         zf.close()
     return {
@@ -392,25 +401,23 @@ def _collect_tar(data: bytes, filename: str, names: list[str] | None, max_entrie
                 skipped.append({"name": name, "reason": f"累计超过上限 {max_total_bytes} 字节"})
                 truncated = True
                 continue
-            stream = tf.extractfile(member)
+            try:
+                stream = tf.extractfile(member)
+            except Exception as exc:  # noqa: BLE001  单个损坏条目不应中断整包
+                skipped.append({"name": name, "reason": f"条目读取失败: {exc}"})
+                continue
             if stream is None:
                 skipped.append({"name": name, "reason": "条目内容不可读"})
                 continue
-            with stream:
-                payload = stream.read(max_entry_bytes)
+            try:
+                with stream:
+                    payload = stream.read(max_entry_bytes)
+            except Exception as exc:  # noqa: BLE001
+                skipped.append({"name": name, "reason": f"条目读取失败: {exc}"})
+                continue
             payload = payload[:max_total_bytes - total]
             total += len(payload)
-            preview = classify_entry(name)
-            entries.append({
-                "name": name,
-                "size": len(payload),
-                "declared_size": int(member.size or 0),
-                "data": payload,
-                "mime": preview["mime"],
-                "previewable": preview["previewable"],
-                "preview_type": preview["preview_type"],
-                "truncated": len(payload) < member.size,
-            })
+            entries.append(_payload_entry(name, payload, member.size))
     finally:
         tf.close()
     return {

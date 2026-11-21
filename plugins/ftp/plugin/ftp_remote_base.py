@@ -1,16 +1,16 @@
-"""远程存储插件公共基类（AIC-015-2）。
+"""FTP 存储插件公共基类。
 
-把 Transport 的字节语义映射为 SDK StoragePlugin 的 10 个契约方法：
+把 Transport 的字节语义映射为 SDK StoragePlugin 的契约方法：
 - 统一对象键归一化与目录穿越防护
 - etag = 内容 MD5（跨后端一致，供秒传核对）
 - 流式读写单块 ≤8MB
 - 缺失对象抛 PluginObjectNotFound，传输失败抛 PluginUnavailable
+- stat_size 走轻量元信息（FTP SIZE），避免为取大小全量下载对象
 """
 
 from __future__ import annotations
 
 import hashlib
-import os
 import queue
 import threading
 import time
@@ -24,24 +24,20 @@ from app.sdk.store_plugin import (
     PutResult,
     StoragePlugin,
 )
-from hj_remote_transport import (
+from ftp_remote_transport import (
     FtpTransport,
     MemoryTransport,
     RemoteObjectNotFound,
     RemoteUnavailable,
     Transport,
-    WebDavTransport,
 )
 
 CHUNK = 8 * 1024 * 1024
+MAX_KEY_LENGTH = 4096
 
 
 class _HashingReader:
-    """包裹上传流：边被读取边累计 MD5 与字节数，单块恒 ≤CHUNK（≤8MB）。
-
-    Transport 的 write_stream 按自身块大小调用 read()，所有字节都经过这里，
-    因此 etag 与旧实现（读全量后 md5）逐字节一致，且不产生整对象缓冲区。
-    """
+    """包裹上传流：边被读取边累计 MD5 与字节数，单块恒 ≤CHUNK（≤8MB）。"""
 
     def __init__(self, fileobj: BinaryIO):
         self._src = fileobj
@@ -82,8 +78,12 @@ class _QueueSink:
 
 
 def _safe_key(key: str) -> str:
-    if not key or "\x00" in key or "\\" in key:
+    if not key or len(key) > MAX_KEY_LENGTH:
         raise ValueError(f"非法对象键: {key!r}")
+    if "\x00" in key or "\\" in key:
+        raise ValueError(f"非法对象键: {key!r}")
+    if any(ord(ch) < 32 for ch in key):
+        raise ValueError(f"非法对象键（含控制字符）: {key!r}")
     parts = [p for p in key.split("/") if p not in ("", ".")]
     if any(p == ".." for p in parts):
         raise ValueError(f"非法对象键（目录穿越）: {key!r}")
@@ -97,22 +97,20 @@ def build_transport(config: dict) -> Transport:
     kind = (config.get("transport") or "memory").lower()
     if kind == "memory":
         store = config.get("_memory_store")
+        readonly = bool(config.get("readonly", False))
+        transport = MemoryTransport(readonly=readonly)
         if isinstance(store, dict):
-            t = MemoryTransport(readonly=bool(config.get("readonly", False)))
-            t._data = store
-            return t
-        return MemoryTransport(readonly=bool(config.get("readonly", False)))
-    if kind == "webdav":
-        return WebDavTransport(config)
+            transport._data = store
+        return transport
     if kind == "ftp":
         return FtpTransport(config)
     raise PluginUnavailable(f"不支持的远程传输类型: {kind}")
 
 
 class RemoteStoragePluginBase(StoragePlugin):
-    """WebDAV/FTP 共享实现；子类仅声明元信息。"""
+    """FTP 存储共享实现；子类仅声明元信息。"""
 
-    transport_kind = "memory"
+    transport_kind = "ftp"
 
     def __init__(self, config: dict | None = None):
         super().__init__(config)
@@ -164,6 +162,8 @@ class RemoteStoragePluginBase(StoragePlugin):
         self._ensure_writable()
         try:
             self.transport.put(k, data, self.readonly)
+        except RemoteObjectNotFound as exc:
+            raise self._map_not_found(exc, k) from exc
         except RemoteUnavailable as exc:
             raise PluginUnavailable(f"写入失败: {exc}") from exc
         return PutResult(key=k, size=len(data), etag=hashlib.md5(data).hexdigest())
@@ -171,7 +171,6 @@ class RemoteStoragePluginBase(StoragePlugin):
     def put_stream(self, key: str, fileobj: BinaryIO) -> PutResult:
         k = _safe_key(key)
         self._ensure_writable()
-        # 能力探测：不支持 write_stream 的 Transport 走旧路径（保持向后兼容）
         write_stream = getattr(self.transport, "write_stream", None)
         if callable(write_stream):
             reader = _HashingReader(fileobj)
@@ -207,7 +206,6 @@ class RemoteStoragePluginBase(StoragePlugin):
         k = _safe_key(key)
         read_into = getattr(self.transport, "read_into", None)
         if not callable(read_into):
-            # 回退：不支持真流式的 Transport 保持旧语义
             blob = self.get(key)
             for i in range(0, len(blob), CHUNK):
                 yield blob[i:i + CHUNK]
@@ -258,6 +256,19 @@ class RemoteStoragePluginBase(StoragePlugin):
         except RemoteUnavailable as exc:
             raise PluginUnavailable(f"读取元信息失败: {exc}") from exc
         return {"size": int(size), "etag": etag}
+
+    def stat_size(self, key: str) -> int:
+        """轻量取大小：优先 SIZE/HEAD，避免为取字节数全量读取对象。"""
+        k = _safe_key(key)
+        stat_size = getattr(self.transport, "stat_size", None)
+        if callable(stat_size):
+            try:
+                return int(stat_size(k))
+            except RemoteObjectNotFound as exc:
+                raise self._map_not_found(exc, k) from exc
+            except RemoteUnavailable as exc:
+                raise PluginUnavailable(f"读取元信息失败: {exc}") from exc
+        return int(self.stat(k)["size"])
 
     def exists(self, key: str) -> bool:
         k = _safe_key(key)

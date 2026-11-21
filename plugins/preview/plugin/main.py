@@ -20,13 +20,17 @@ PDF_EXTS = frozenset({"pdf"})
 VIDEO_EXTS = frozenset({"mp4", "webm", "mov", "m4v", "ogv"})
 AUDIO_EXTS = frozenset({"mp3", "wav", "ogg", "m4a", "aac", "flac", "opus"})
 TEXT_EXTS = frozenset({
-    "txt", "md", "json", "csv", "log", "xml", "yml", "yaml", "ini", "cfg", "toml",
+    "txt", "md", "json", "csv", "tsv", "log", "xml", "yml", "yaml", "ini", "cfg", "toml",
     "py", "js", "ts", "java", "c", "cpp", "h", "go", "rs", "sh", "sql", "rst",
     "html", "css",
 })
-#: Office 文档：需转换服务（占位，仅下载引导）
+#: doc_viewer 已支持的现代 Office / ODF 格式，按对应预览类型内联渲染
+DOC_EXTS = frozenset({"docx"})
+SHEET_EXTS = frozenset({"xlsx"})
+SLIDES_EXTS = frozenset({"pptx"})
+#: 旧版 Office 与暂未接入现代查看器的格式：仅下载引导
 OFFICE_EXTS = frozenset({
-    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "wps", "odt", "ods", "odp", "rtf",
+    "doc", "xls", "ppt", "wps", "odt", "ods", "odp", "rtf",
 })
 
 
@@ -46,7 +50,8 @@ class PreviewPlugin:
 
     def capabilities(self) -> dict:
         return {"preview": True,
-                "types": ["image", "pdf", "video", "audio", "text", "docx"]}
+                "types": ["image", "pdf", "video", "audio", "text",
+                          "docx", "xlsx", "pptx"]}
 
     def health_check(self) -> HealthStatus:
         return HealthStatus(healthy=True, writable=False, message="preview ready")
@@ -64,10 +69,14 @@ class PreviewPlugin:
             return True, "audio"
         if ext in TEXT_EXTS:
             return True, "text"
-        if ext == "docx":
-            return True, "docx"  # 零依赖正文抽取（docx_text），完整排版仍建议下载
+        if ext in DOC_EXTS:
+            return True, "docx"
+        if ext in SHEET_EXTS:
+            return True, "xlsx"
+        if ext in SLIDES_EXTS:
+            return True, "pptx"
         if ext in OFFICE_EXTS:
-            return False, "office"  # 其余 Office（doc/xls/ppt）转换服务未接入（占位）
+            return False, "office"  # 旧版 Office / ODF 转换服务未接入（占位）
         return False, "none"
 
     def media_type(self, filename: str, preview_type: str) -> str:

@@ -19,6 +19,8 @@ from app.sdk.store_plugin import (
     StoragePlugin,
 )
 
+CHUNK = 8 * 1024 * 1024
+
 
 class S3Plugin(StoragePlugin):
     plugin_id = "s3"
@@ -66,7 +68,10 @@ class S3Plugin(StoragePlugin):
         return self._client
 
     def _bucket(self) -> str:
-        return self.config["bucket"]
+        bucket = self.config.get("bucket")
+        if not bucket:
+            raise PluginUnavailable("S3 配置缺少 bucket")
+        return str(bucket)
 
     @staticmethod
     def _map_error(exc: Exception) -> None:
@@ -106,10 +111,18 @@ class S3Plugin(StoragePlugin):
                             int((time.time() - start) * 1000))
 
     def put(self, key: str, data: bytes) -> PutResult:
-        return self.put_stream(key, io.BytesIO(data))
+        """小对象直接单次写入，避免包装 BytesIO 后再走分片路径。"""
+        self._ensure_writable()
+        try:
+            self.client().put_object(
+                Bucket=self._bucket(), Key=key, Body=data, ContentLength=len(data))
+        except Exception as exc:
+            self._map_error(exc)
+            raise  # pragma: no cover
+        return PutResult(key=key, size=len(data), etag=hashlib.md5(data).hexdigest())
 
     #: 分片大小：单块内存上限（与平台流式读写块一致，避免大文件整读入内存）
-    PART_SIZE = 8 * 1024 * 1024
+    PART_SIZE = CHUNK
 
     @staticmethod
     def _read_chunk(fileobj: BinaryIO, size: int) -> bytes:
@@ -189,14 +202,24 @@ class S3Plugin(StoragePlugin):
             raise  # pragma: no cover
 
     def open_read(self, key: str) -> Iterator[bytes]:
+        body = None
         try:
             resp = self.client().get_object(Bucket=self._bucket(), Key=key)
             body = resp["Body"]
-            while chunk := body.read(1024 * 1024 * 8):
+            while chunk := body.read(CHUNK):
                 yield chunk
+        except GeneratorExit:
+            raise
         except Exception as exc:
             self._map_error(exc)
             raise  # pragma: no cover
+        finally:
+            # 消费者提前 break 时也要释放 HTTP 连接，避免连接池被占满
+            if body is not None:
+                try:
+                    body.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     def stat(self, key: str) -> dict:
         try:

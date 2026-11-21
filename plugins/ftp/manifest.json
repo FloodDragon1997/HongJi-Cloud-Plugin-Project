@@ -1,7 +1,7 @@
 {
   "id": "ftp",
   "name": "FTP 存储",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "type": "storage",
   "entry": "plugin/main.py",
   "permissions": ["net.outbound"],

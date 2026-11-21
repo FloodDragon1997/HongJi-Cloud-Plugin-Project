@@ -129,7 +129,7 @@ def _read_capped(resp) -> bytes:
                 raise HTTPException(413, f"压缩包超过上限 {MAX_ARCHIVE_BYTES} 字节，请下载后查看")
         except ValueError:
             pass
-    chunks: list[bytes] = []
+    chunks = bytearray()
     total = 0
     while True:
         chunk = resp.read(_CHUNK)
@@ -138,8 +138,8 @@ def _read_capped(resp) -> bytes:
         total += len(chunk)
         if total > MAX_ARCHIVE_BYTES:
             raise HTTPException(413, f"压缩包超过上限 {MAX_ARCHIVE_BYTES} 字节，请下载后查看")
-        chunks.append(chunk)
-    return b"".join(chunks)
+        chunks.extend(chunk)
+    return bytes(chunks)
 
 
 def _credential_headers(request: Request) -> dict:
@@ -237,8 +237,10 @@ def view_endpoint(file_id: int, request: Request, user: CurrentUser) -> HTMLResp
         _render_page(file_id, listing),
         headers={
             "Content-Security-Policy":
-                "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
+                "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "
+                "form-action 'none'; frame-ancestors 'self'",
             "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
         },
     )
 

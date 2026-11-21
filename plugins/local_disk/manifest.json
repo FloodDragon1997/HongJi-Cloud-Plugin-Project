@@ -1,7 +1,7 @@
 {
   "id": "local_disk",
   "name": "本地磁盘",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "storage",
   "entry": "plugin/main.py",
   "permissions": ["fs.read", "fs.write", "fs.list"],
