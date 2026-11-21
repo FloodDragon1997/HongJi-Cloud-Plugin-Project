@@ -58,7 +58,7 @@ HJ_DOC_VIEWER_PLATFORM_BASE=https://your-platform.example
 ```powershell
 Remove-Item -Recurse -Force .\plugins\doc_viewer\__pycache__ -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force .\dist | Out-Null
-Compress-Archive -Path .\plugins\doc_viewer\* -DestinationPath .\dist\doc_viewer-1.0.0.zip -Force
+Compress-Archive -Path .\plugins\doc_viewer\* -DestinationPath .\dist\doc_viewer-1.0.1.zip -Force
 ```
 
 安装后需「启用」并通过健康检查（自检会构造最小 docx/xlsx/pptx 内存样例）。
